@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Reply Ledger 產品導覽" />
+  <title>Reply Ledger｜60 秒導覽</title>
+  <style>
+    :root{--paper:#ebe8df;--ink:#161713;--muted:#6d6b64;--red:#d94c33;--line:rgba(22,23,19,.2)}
+    *{box-sizing:border-box}html,body{margin:0;background:var(--paper);color:var(--ink);font-family:"Noto Sans TC","Microsoft JhengHei",sans-serif;overflow:hidden}
+    button,a{font:inherit;color:inherit}.stage{height:100svh;position:relative}.top{position:fixed;z-index:4;inset:0 0 auto;display:flex;justify-content:space-between;padding:22px 28px;border-bottom:1px solid var(--ink);font:10px/1 ui-monospace,Consolas,monospace;letter-spacing:.08em}.top a{text-decoration:none}.slide{position:absolute;inset:64px 0 70px;padding:clamp(26px,6vw,90px);display:grid;grid-template-columns:.85fr 1.15fr;gap:7vw;align-items:center;opacity:0;transform:translateY(24px);pointer-events:none;transition:opacity .6s ease,transform .6s ease}.slide.active{opacity:1;transform:none;pointer-events:auto}.index{color:var(--red);font:11px/1 ui-monospace,Consolas,monospace}.copy h1,.copy h2{margin:22px 0 24px;font:600 clamp(48px,8vw,124px)/.93 "Noto Serif TC","PMingLiU",serif;letter-spacing:-.055em}.copy h2{font-size:clamp(43px,6vw,92px)}.copy p{max-width:580px;margin:0;color:var(--muted);font-size:clamp(15px,1.4vw,21px);line-height:1.85}.proof{min-height:55vh;padding:34px;background:#f8f6ef;border:1px solid var(--ink);box-shadow:14px 14px 0 var(--ink)}.proof .label{display:flex;justify-content:space-between;padding-bottom:14px;border-bottom:1px solid var(--line);font:9px/1 ui-monospace,Consolas,monospace;color:var(--red)}.message{margin:42px 0 22px;font:500 clamp(20px,2.4vw,35px)/1.65 "Noto Serif TC","PMingLiU",serif}.annotation{padding:18px 0;border-top:2px solid var(--ink);color:var(--red);font-size:13px;line-height:1.7}.choices{display:grid;grid-template-columns:2fr 1fr 1fr;gap:8px;margin-top:38px}.choices span{padding:15px;border:1px solid var(--ink);font-size:11px;text-align:center}.choices span:first-child{background:var(--ink);color:#fff}.ledger-lines{background:repeating-linear-gradient(to bottom,transparent 0,transparent 47px,var(--line) 48px);min-height:55vh;padding:30px}.ledger-lines p{margin:0;padding:13px 0;font:17px/1.4 "Noto Serif TC","PMingLiU",serif}.ledger-lines em{color:var(--red);font-style:normal}.controls{position:fixed;z-index:4;inset:auto 0 0;height:70px;display:flex;align-items:center;border-top:1px solid var(--ink)}.controls button{height:100%;width:90px;border:0;border-right:1px solid var(--ink);background:transparent;cursor:pointer;font-size:22px}.controls button:hover{background:var(--ink);color:#fff}.progress{height:2px;flex:1;margin:0 24px;background:var(--line)}.progress i{display:block;height:100%;background:var(--red);transition:width .5s ease}.count{width:90px;text-align:center;font:10px/1 ui-monospace,Consolas,monospace}
+    @media(max-width:720px){.top{padding:18px}.slide{inset:55px 0 62px;padding:28px 18px;display:block;overflow:auto}.copy h1,.copy h2{font-size:45px;margin:18px 0}.copy p{font-size:14px}.proof,.ledger-lines{min-height:auto;margin-top:32px;box-shadow:7px 7px 0 var(--ink)}.message{font-size:19px;margin:28px 0}.choices{grid-template-columns:1fr 1fr}.choices span:first-child{grid-column:1/-1}.controls{height:62px}}
+    @media(prefers-reduced-motion:reduce){.slide{transition:none}}
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <header class="top"><span>REPLY LEDGER · PRODUCT TOUR</span><a href="/">進入工作台 ↗</a></header>
+    <section class="slide active"><div class="copy"><span class="index">00 / 問題</span><h1>客服不缺一句漂亮回答。</h1><p>真正缺的是：哪些訊息快漏回、答案從哪裡來，以及 AI 不確定時能不能誠實停下來。</p></div><div class="proof"><div class="label"><span>CUSTOMER MESSAGE</span><span>WAITING · 18M</span></div><p class="message">「上週裝的燈一直閃，剛剛還有滋滋聲。」</p><div class="annotation">危險訊號：不得要求客戶自行拆線。立即停用，轉交售後技師。</div></div></section>
+    <section class="slide"><div class="copy"><span class="index">01 / 觀察</span><h2>先判讀，再動筆。</h2><p>每則訊息都有意圖、急迫度、風險與等待時間。診所模式遇到用藥、出血或急症線索，直接要求真人接手。</p></div><div class="ledger-lines"><p><em>意圖</em>　術後症狀</p><p><em>急迫度</em>　高</p><p><em>風險</em>　持續出血／需真人判斷</p><p><em>邊界</em>　不得診斷，不得推算劑量</p></div></section>
+    <section class="slide"><div class="copy"><span class="index">02 / 根據</span><h2>不是它覺得，是規則這樣寫。</h2><p>草稿旁邊直接列出價目表、衛教資料與守門規則。找不到根據時，答案不是編出來，而是明確說不知道。</p></div><div class="proof"><div class="label"><span>REPLY DRAFT</span><span>CONFIDENCE · 82%</span></div><p class="message">「安裝費需依現場出線與固定方式確認，我先不替你亂估。」</p><div class="annotation">根據 ① 零售價目表　② 選型手冊　③ 安裝報價規則</div></div></section>
+    <section class="slide"><div class="copy"><span class="index">03 / 決定</span><h2>最後說話的人，永遠是人。</h2><p>採用、修改、拒絕都被記錄；人工修正版才會進入案例簿。AI 不會因一次修改就偷偷重寫全部規則。</p></div><div class="proof"><div class="label"><span>HUMAN DECISION</span><span>APPEND ONLY</span></div><p class="message">每一句建議，都留下根據；每一次決定，都找得到人。</p><div class="choices"><span>採用，交真人確認</span><span>修改</span><span>拒絕</span></div></div></section>
+    <footer class="controls"><button id="prev" aria-label="上一幕">←</button><button id="next" aria-label="下一幕">→</button><div class="progress"><i id="bar" style="width:25%"></i></div><span class="count" id="count">01 / 04</span></footer>
+  </main>
+  <script>
+    const slides=[...document.querySelectorAll('.slide')],bar=document.getElementById('bar'),count=document.getElementById('count');let current=0,locked=false;
+    function show(next){current=Math.max(0,Math.min(slides.length-1,next));slides.forEach((s,i)=>s.classList.toggle('active',i===current));bar.style.width=((current+1)/slides.length*100)+'%';count.textContent=String(current+1).padStart(2,'0')+' / '+String(slides.length).padStart(2,'0')}
+    document.getElementById('prev').onclick=()=>show(current-1);document.getElementById('next').onclick=()=>show(current+1);
+    addEventListener('keydown',e=>{if(['ArrowRight','ArrowDown',' '].includes(e.key))show(current+1);if(['ArrowLeft','ArrowUp'].includes(e.key))show(current-1)});
+    addEventListener('wheel',e=>{if(locked||Math.abs(e.deltaY)<20)return;locked=true;show(current+(e.deltaY>0?1:-1));setTimeout(()=>locked=false,900)},{passive:true});
+    let startY=0;addEventListener('touchstart',e=>startY=e.touches[0].clientY,{passive:true});addEventListener('touchend',e=>{const d=startY-e.changedTouches[0].clientY;if(Math.abs(d)>45)show(current+(d>0?1:-1))},{passive:true});
+  </script>
+</body>
+</html>
