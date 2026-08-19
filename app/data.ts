@@ -1,5 +1,5 @@
 export type Mode = "retail" | "clinic";
-export type View = "workspace" | "knowledge" | "audit";
+export type View = "workspace" | "line" | "knowledge" | "audit";
 
 export type LedgerCase = {
   id: string;
@@ -23,13 +23,13 @@ export const modeInfo = {
   retail: {
     name: "燈飾零售",
     short: "零售",
-    status: "LINE 觀察中",
+    status: "DEMO 模擬中",
     note: "可以草擬商品與報價回覆；未知的安裝費與庫存不得猜測。",
   },
   clinic: {
     name: "診所觀察員",
     short: "診所",
-    status: "只讀監測",
+    status: "診所 DEMO",
     note: "涉及醫療與客訴，AI 只能分析、提醒與草擬，永遠不能自行送出。",
   },
 } as const;

@@ -1,8 +1,9 @@
-# vinext-starter
+# Reply Ledger｜回覆帳簿
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Human-reviewed LINE reply workspace for lighting retail and clinic-observer
+workflows. The product keeps demo cases visibly separate from verified live
+LINE events, records incoming events in D1, and never sends from the AI draft
+surface automatically.
 
 ## Prerequisites
 
@@ -18,14 +19,25 @@ npm run build
 
 This starter does not use `wrangler.jsonc`.
 
-## Included Shape
+## LINE Integration
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+- Webhook endpoint: `/api/line/webhook`
+- Verifies the raw request body with `x-line-signature` and HMAC-SHA256 before parsing.
+- Deduplicates redeliveries by LINE `webhookEventId`.
+- Stores only the event fields needed by the inbox; raw webhook JSON and reply tokens are not retained.
+- `/api/line/send` is authenticated, idempotent, and unavailable until a channel access token is configured.
+
+Copy `.env.example` to `.env.local` for local work. Production values belong in
+Sites environment variables and must be marked secret:
+
+- `LINE_CHANNEL_SECRET`
+- `LINE_CHANNEL_ACCESS_TOKEN`
+- `LINE_WORKSPACE_MODE` (`retail` or `clinic`)
+
+The dashboard requires Sign in with ChatGPT outside local development. For LINE
+to reach the webhook, production must expose the Site publicly while retaining
+the page- and API-level checks in this source. Do not enable real clinic traffic
+until privacy, retention, and escalation procedures have been reviewed.
 
 ## Workspace Auth Headers
 
@@ -91,7 +103,7 @@ actions tied to the current ChatGPT user. Leave public content anonymous.
 
 - `npm run dev`: start local development
 - `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
+- `npm test`: build the product and verify rendering plus LINE signature handling
 - `npm run db:generate`: generate Drizzle migrations after schema changes
 
 ## Learn More

@@ -5,6 +5,25 @@ import { casesByMode, knowledgeByMode, modeInfo, seededAudit, type Mode, type Vi
 
 type AuditRecord = (typeof seededAudit)[number];
 type LearnedRule = { id: string; mode: Mode; title: string; body: string; createdAt: string };
+type LineStatus = {
+  databaseReady: boolean;
+  receiveReady: boolean;
+  sendReady: boolean;
+  workspaceMode: string;
+  eventCount: number;
+  lastEventAt: number | null;
+};
+type LineInboxEvent = {
+  id: number;
+  webhookEventId: string;
+  sourceType: string | null;
+  sourceId: string | null;
+  eventType: string;
+  messageType: string | null;
+  messageText: string | null;
+  eventTimestamp: number;
+  isRedelivery: boolean;
+};
 
 const storageKey = "reply-ledger-v1";
 
@@ -21,6 +40,9 @@ export default function ReplyLedger() {
   const [toast, setToast] = useState("");
   const [newRuleOpen, setNewRuleOpen] = useState(false);
   const [newRule, setNewRule] = useState("");
+  const [lineStatus, setLineStatus] = useState<LineStatus | null>(null);
+  const [lineInbox, setLineInbox] = useState<LineInboxEvent[]>([]);
+  const [lineLoading, setLineLoading] = useState(true);
   const auditCounter = useRef(200);
 
   const cases = casesByMode[mode];
@@ -40,6 +62,21 @@ export default function ReplyLedger() {
       }
       setHydrated(true);
     });
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      fetch("/api/line/status", { headers: { accept: "application/json" } }).then(async (response) => response.ok ? await response.json() as LineStatus : null),
+      fetch("/api/line/inbox?limit=50", { headers: { accept: "application/json" } }).then(async (response) => response.ok ? await response.json() as { events: LineInboxEvent[] } : null),
+    ]).then(([statusResult, inboxResult]) => {
+      if (!active) return;
+      if (statusResult) setLineStatus(statusResult as LineStatus);
+      if (inboxResult?.events) setLineInbox(inboxResult.events as LineInboxEvent[]);
+    }).finally(() => {
+      if (active) setLineLoading(false);
+    });
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -108,6 +145,17 @@ export default function ReplyLedger() {
   }
 
   const modeLearned = useMemo(() => learned.filter((item) => item.mode === mode), [learned, mode]);
+  const lineState = lineStatus?.receiveReady ? (lineStatus.eventCount > 0 ? "live" : "ready") : "demo";
+  const lineStateLabel = lineState === "live" ? "LINE 已連線" : lineState === "ready" ? "LINE 待測試" : modeInfo[mode].status;
+
+  function maskLineId(value: string | null) {
+    if (!value) return "未知來源";
+    return `${value.slice(0, 4)}••••${value.slice(-4)}`;
+  }
+
+  function formatLineTime(timestamp: number) {
+    return new Intl.DateTimeFormat("zh-TW", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(timestamp));
+  }
 
   return (
     <main className={`ledger-shell mode-${mode}`}>
@@ -126,20 +174,26 @@ export default function ReplyLedger() {
           </div>
           <button className={`pause-button ${paused ? "paused" : ""}`} type="button" onClick={() => { setPaused(!paused); flash(paused ? "AI 觀察已恢復。" : "AI 觀察已暫停，真人仍可查看既有內容。"); }}>
             <span className="live-dot" aria-hidden="true" />
-            {paused ? "恢復觀察" : modeInfo[mode].status}
+            {paused ? "恢復觀察" : lineStateLabel}
           </button>
         </div>
       </header>
 
       <nav className="view-nav" aria-label="主要頁面">
-        {(["workspace", "knowledge", "audit"] as View[]).map((item, index) => (
+        {(["workspace", "line", "knowledge", "audit"] as View[]).map((item, index) => (
           <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}>
-            <span>0{index + 1}</span>{item === "workspace" ? "工作台" : item === "knowledge" ? "知識帳簿" : "稽核紀錄"}
+            <span>0{index + 1}</span>{item === "workspace" ? "工作台" : item === "line" ? "LINE 收件匣" : item === "knowledge" ? "知識帳簿" : "稽核紀錄"}
           </button>
         ))}
         <a className="tour-link" href="/intro.html">觀看 60 秒導覽 ↗</a>
         <p>{modeInfo[mode].note}</p>
       </nav>
+
+      <button className={`integration-strip state-${lineState}`} type="button" onClick={() => setView("line")}>
+        <span className="integration-kicker">CONNECTION</span>
+        <strong>{lineLoading ? "目前顯示 Demo 資料，正在確認 LINE 狀態" : lineState === "live" ? `已收到 ${lineStatus?.eventCount ?? 0} 個真實事件` : lineState === "ready" ? "Webhook 已設定，等待第一則真實訊息" : "目前顯示 Demo 資料，尚未連接 LINE 官方帳號"}</strong>
+        <span>{lineStatus?.sendReady ? "人工傳送已備妥" : "傳送功能鎖定"} →</span>
+      </button>
 
       {view === "workspace" && (
         <section className="workbench" aria-label="AI 客服觀察工作台">
@@ -200,6 +254,34 @@ export default function ReplyLedger() {
             <button className="quiet-handoff" type="button" onClick={handToHuman}>不使用建議，直接交給真人</button>
             <p className="send-lock">AI 不會自行送出。所有採用、修改與拒絕都會留下紀錄。</p>
           </aside>
+        </section>
+      )}
+
+      {view === "line" && (
+        <section className="page-sheet line-view">
+          <div className="page-title">
+            <div><p className="eyebrow">LIVE INBOX · VERIFIED WEBHOOKS ONLY</p><h2>真實訊息與示範資料，分開記帳。</h2></div>
+            <span className={`connection-stamp state-${lineState}`}>{lineState === "live" ? "CONNECTED" : lineState === "ready" ? "READY" : "NOT CONNECTED"}</span>
+          </div>
+          <div className="connection-ledger">
+            <article><span>01</span><p>資料庫</p><strong>{lineStatus?.databaseReady ? "持久化已就緒" : "尚未建立"}</strong></article>
+            <article><span>02</span><p>接收</p><strong>{lineStatus?.receiveReady ? "簽章驗證已備妥" : "等待 Channel secret"}</strong></article>
+            <article><span>03</span><p>傳送</p><strong>{lineStatus?.sendReady ? "人工確認後可送出" : "等待 Access token"}</strong></article>
+          </div>
+          <div className="live-inbox-head"><p>已驗證事件</p><span>{lineInbox.length} / 最近 50 筆</span></div>
+          {lineLoading ? <div className="empty-state">正在讀取連線狀態。</div> : lineInbox.length === 0 ? (
+            <div className="empty-state">尚未收到真實 LINE 訊息。完成 LINE Developers 設定後，從測試帳號傳一則訊息，會出現在這裡。</div>
+          ) : (
+            <div className="live-inbox-list">
+              {lineInbox.map((event) => <article className="live-inbox-row" key={event.webhookEventId}>
+                <time>{formatLineTime(event.eventTimestamp)}</time>
+                <span>{maskLineId(event.sourceId)}</span>
+                <div><b>{event.messageType === "text" ? "文字訊息" : event.eventType}</b><p>{event.messageText ?? "（此事件沒有文字內容）"}</p></div>
+                {event.isRedelivery && <em>REDELIVERY</em>}
+              </article>)}
+            </div>
+          )}
+          <p className="privacy-note">僅保存營運所需欄位，不保存 LINE Webhook 原始內容或 reply token。診所模式在完成個資與醫療流程審查前，不應接入真實患者資料。</p>
         </section>
       )}
 
