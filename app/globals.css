@@ -108,6 +108,31 @@ blockquote { margin: 0; font-family: "Noto Serif TC", "PMingLiU", serif; font-si
 .decision-row .primary-action { background: var(--ink); color: var(--white); }
 .decision-row .primary-action:hover { background: var(--accent); border-color: var(--accent); }
 .send-lock { margin: 0 24px 22px; color: var(--muted); font-size: 9px; text-align: center; }
+.send-confirmation {
+  margin: 22px 24px 0;
+  padding: 20px;
+  border: 2px solid var(--ink);
+  background: var(--paper);
+}
+.send-confirmation h3 {
+  margin: 0 0 14px;
+  font: 600 20px/1.35 "Noto Serif TC", "PMingLiU", serif;
+}
+.send-confirmation-copy {
+  max-height: 190px;
+  margin: 0;
+  padding: 14px 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  white-space: pre-wrap;
+  font-size: 12px;
+  line-height: 1.75;
+}
+.send-error { margin: 14px 0 0; color: var(--accent); font-size: 11px; line-height: 1.6; }
+.send-confirmation-actions { display: grid; grid-template-columns: 1fr 1.4fr; gap: 8px; margin-top: 16px; }
+.send-confirmation-actions button { min-height: 44px; border: 1px solid var(--ink); background: transparent; cursor: pointer; }
+.send-confirmation-actions button:disabled { opacity: .45; cursor: wait; }
 @media (max-width: 1040px) {
   .workbench { grid-template-columns: 220px 1fr; }
   .advice-panel { grid-column: 1 / -1; border-top: 1px solid var(--ink); }
@@ -374,6 +399,8 @@ button { color: inherit; }
   blockquote { font-size: 17px; }
   .sources { margin: 0 18px; }
   .handoff-banner, .quiet-handoff { width: calc(100% - 36px); margin-left: 18px; margin-right: 18px; }
+  .send-confirmation { margin-left: 18px; margin-right: 18px; }
+  .send-confirmation-actions { grid-template-columns: 1fr; }
   .decision-row { padding-left: 18px; padding-right: 18px; }
   .send-lock { margin-left: 18px; margin-right: 18px; }
   .page-sheet { padding: 34px 18px 54px; }

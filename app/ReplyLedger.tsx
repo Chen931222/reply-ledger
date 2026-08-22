@@ -28,6 +28,7 @@ type WorkbenchCase = LedgerCase & {
   kind: "live" | "demo";
   sourceId?: string | null;
 };
+type SendState = "idle" | "confirming" | "sending" | "sent" | "error";
 
 const storageKey = "reply-ledger-v1";
 
@@ -60,7 +61,10 @@ export default function ReplyLedger() {
   const [lineStatus, setLineStatus] = useState<LineStatus | null>(null);
   const [lineInbox, setLineInbox] = useState<LineInboxEvent[]>([]);
   const [lineLoading, setLineLoading] = useState(true);
+  const [sendState, setSendState] = useState<SendState>("idle");
+  const [sendError, setSendError] = useState("");
   const auditCounter = useRef(200);
+  const sendRequestId = useRef<string | null>(null);
 
   const liveCases = useMemo<WorkbenchCase[]>(() => {
     const conversations = new Map<string, LineInboxEvent[]>();
@@ -158,6 +162,9 @@ export default function ReplyLedger() {
     setSelectedId(nextCases[0].id);
     setDraft(nextCases[0].draft);
     setEditing(false);
+    setSendState("idle");
+    setSendError("");
+    sendRequestId.current = null;
     setView("workspace");
   }
 
@@ -179,24 +186,69 @@ export default function ReplyLedger() {
     setAudit((current) => [record, ...current]);
   }
 
-  function adoptDraft() {
-    const wasEdited = currentDraft.trim() !== selected.draft.trim();
-    logAction(wasEdited ? "修改後採用" : "採用建議", `保留人工確認；未由 AI 自動送出。${wasEdited ? "修改內容已寫入案例簿。" : ""}`);
-    if (wasEdited) {
-      setLearned((items) => [{
-        id: `L-${Date.now()}`,
-        mode,
-        title: `${selected.title} · 人工修正版`,
-        body: currentDraft,
-        createdAt: "剛剛",
-      }, ...items]);
+  function prepareLineSend() {
+    if (selected.kind !== "live" || !selected.sourceId) {
+      flash("示範案例沒有真實 LINE 收件人，不能傳送。");
+      return;
+    }
+    if (!lineStatus?.sendReady) {
+      flash("LINE 傳送功能尚未就緒，請先檢查 Access Token。");
+      return;
+    }
+    if (!currentDraft.trim()) {
+      flash("訊息內容不能是空白。");
+      return;
     }
     setEditing(false);
-    flash("已採用並送交真人確認；AI 沒有自行傳送訊息。");
+    setSendError("");
+    sendRequestId.current = crypto.randomUUID();
+    setSendState("confirming");
+  }
+
+  async function confirmLineSend() {
+    if (selected.kind !== "live" || !selected.sourceId || !sendRequestId.current) return;
+    setSendState("sending");
+    setSendError("");
+    try {
+      const response = await fetch("/api/line/send", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          to: selected.sourceId,
+          text: currentDraft.trim(),
+          requestId: sendRequestId.current,
+        }),
+      });
+      const result = await response.json().catch(() => null) as { error?: string } | null;
+      if (!response.ok) {
+        if (response.status === 409) throw new Error("這次傳送請求已處理過，請先到 LINE 確認是否收到，避免重複傳送。");
+        throw new Error(result?.error ?? "LINE 沒有接受這則訊息。");
+      }
+
+      const wasEdited = currentDraft.trim() !== selected.draft.trim();
+      logAction("已傳送 LINE", `${wasEdited ? "人工修改後傳送" : "採用建議後傳送"}；收件人 ${maskLineId(selected.sourceId)}。`);
+      if (wasEdited) {
+        setLearned((items) => [{
+          id: `L-${Date.now()}`,
+          mode,
+          title: `${selected.title} · 人工修正版`,
+          body: currentDraft.trim(),
+          createdAt: "剛剛",
+        }, ...items]);
+      }
+      setSendState("sent");
+      flash("訊息已由 LINE 官方帳號成功傳送。");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "傳送失敗，請稍後再試。");
+      setSendState("error");
+    }
   }
 
   function rejectDraft() {
     logAction("拒絕建議", "建議未送出；保留原始內容供後續檢討。 ");
+    setSendState("idle");
+    setSendError("");
+    sendRequestId.current = null;
     flash("已拒絕。這則建議不會被送出，也不會自動學習。");
   }
 
@@ -269,7 +321,7 @@ export default function ReplyLedger() {
           <aside className="queue-panel">
             <div className="section-label"><span>01</span><p>{cases[0]?.kind === "live" ? "真實待回覆" : "示範案例"}</p><strong>{cases.length}</strong></div>
             {cases.map((item) => (
-              <button className={`queue-item ${item.id === selected.id ? "active" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); }}>
+              <button className={`queue-item ${item.id === selected.id ? "active" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); setSendState("idle"); setSendError(""); sendRequestId.current = null; }}>
                 <span className="queue-topline"><span className={item.requiresHuman ? "risk-tag" : ""}>{item.tag}</span><time>{item.waiting}</time></span>
                 <strong>{item.customer}</strong>
                 <span>{item.messages[item.messages.length - 1].text}</span>
@@ -305,7 +357,7 @@ export default function ReplyLedger() {
             <div className="draft-block">
               <p className="margin-label">DRAFT / HUMAN REVIEW REQUIRED</p>
               {editing ? (
-                <textarea aria-label="修改建議回覆" value={currentDraft} onChange={(event) => { if (selected.id !== selectedId) setSelectedId(selected.id); setDraft(event.target.value); }} rows={11} />
+                <textarea aria-label="修改建議回覆" value={currentDraft} onChange={(event) => { if (selected.id !== selectedId) setSelectedId(selected.id); setDraft(event.target.value); setSendState("idle"); setSendError(""); sendRequestId.current = null; }} rows={11} />
               ) : <blockquote>{currentDraft}</blockquote>}
             </div>
             <details className="sources" open>
@@ -315,13 +367,25 @@ export default function ReplyLedger() {
               ))}
             </details>
             {selected.requiresHuman && <button className="handoff-banner" type="button" onClick={handToHuman}><strong>高風險事件</strong><span>交給真人處理 →</span></button>}
+            {(sendState === "confirming" || sendState === "sending" || sendState === "error") && (
+              <section className="send-confirmation" role="alertdialog" aria-labelledby="send-confirmation-title" aria-describedby="send-confirmation-copy">
+                <p className="margin-label">FINAL CHECK · THIS WILL SEND</p>
+                <h3 id="send-confirmation-title">確認傳送給 {maskLineId(selected.sourceId ?? null)}</h3>
+                <p id="send-confirmation-copy" className="send-confirmation-copy">{currentDraft.trim()}</p>
+                {sendError && <p className="send-error" role="alert">{sendError}</p>}
+                <div className="send-confirmation-actions">
+                  <button type="button" onClick={() => { setSendState("idle"); setSendError(""); sendRequestId.current = null; }} disabled={sendState === "sending"}>返回修改</button>
+                  <button type="button" className="primary-action" onClick={confirmLineSend} disabled={sendState === "sending"}>{sendState === "sending" ? "傳送中…" : sendState === "error" ? "重新確認傳送" : "確認，現在傳送"}</button>
+                </div>
+              </section>
+            )}
             <div className="decision-row" aria-label="回覆決策">
-              <button type="button" className="primary-action" onClick={adoptDraft} disabled={paused}>採用，交真人確認</button>
-              <button type="button" onClick={() => { if (selected.id !== selectedId) { setSelectedId(selected.id); setDraft(selected.draft); } setEditing(!editing); }}>{editing ? "完成修改" : "修改"}</button>
+              <button type="button" className="primary-action" onClick={prepareLineSend} disabled={paused || selected.kind !== "live" || sendState === "sending" || sendState === "sent"}>{sendState === "sent" ? "已傳送到 LINE" : selected.kind === "live" ? "確認並傳送到 LINE" : "示範案例不可傳送"}</button>
+              <button type="button" onClick={() => { if (selected.id !== selectedId) { setSelectedId(selected.id); setDraft(selected.draft); } setSendState("idle"); setSendError(""); sendRequestId.current = null; setEditing(!editing); }}>{editing ? "完成修改" : "修改"}</button>
               <button type="button" onClick={rejectDraft}>拒絕</button>
             </div>
             <button className="quiet-handoff" type="button" onClick={handToHuman}>不使用建議，直接交給真人</button>
-            <p className="send-lock">AI 不會自行送出。所有採用、修改與拒絕都會留下紀錄。</p>
+            <p className="send-lock">只有真人完成第二次確認後才會傳送；LINE 結果與操作者會留下紀錄。</p>
           </aside>
         </section>
       )}

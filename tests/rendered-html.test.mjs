@@ -24,7 +24,7 @@ test("server-renders the Reply Ledger product surface", async () => {
   assert.match(html, /診所觀察員/);
   assert.match(html, /LINE 收件匣/);
   assert.match(html, /目前顯示 Demo 資料/);
-  assert.match(html, /AI 不會自行送出/);
+  assert.match(html, /只有真人完成第二次確認後才會傳送/);
   assert.match(html, /https:\/\/reply-ledger\.example\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|Building your site|react-loading-skeleton/);
 });
@@ -42,6 +42,8 @@ test("ships the tour and both guarded scenario sets", async () => {
   assert.match(client, /localStorage/);
   assert.match(client, /轉交真人/);
   assert.match(client, /稽核紀錄/);
+  assert.match(client, /\/api\/line\/send/);
+  assert.match(client, /確認，現在傳送/);
 });
 
 test("LINE webhook rejects spoofed requests and accepts a correctly signed verification request", async () => {
