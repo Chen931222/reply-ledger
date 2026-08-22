@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { casesByMode, knowledgeByMode, modeInfo, seededAudit, type Mode, type View } from "./data";
+import { casesByMode, knowledgeByMode, modeInfo, seededAudit, type LedgerCase, type Mode, type View } from "./data";
 
 type AuditRecord = (typeof seededAudit)[number];
 type LearnedRule = { id: string; mode: Mode; title: string; body: string; createdAt: string };
@@ -24,8 +24,25 @@ type LineInboxEvent = {
   eventTimestamp: number;
   isRedelivery: boolean;
 };
+type WorkbenchCase = LedgerCase & {
+  kind: "live" | "demo";
+  sourceId?: string | null;
+};
 
 const storageKey = "reply-ledger-v1";
+
+function formatMessageTime(timestamp: number) {
+  return new Intl.DateTimeFormat("zh-TW", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(timestamp));
+}
+
+function formatWaitingTime(timestamp: number) {
+  const minutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000));
+  if (minutes < 1) return "剛剛";
+  if (minutes < 60) return `${minutes} 分鐘`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小時`;
+  return `${Math.floor(hours / 24)} 天`;
+}
 
 export default function ReplyLedger() {
   const [mode, setMode] = useState<Mode>("retail");
@@ -45,8 +62,55 @@ export default function ReplyLedger() {
   const [lineLoading, setLineLoading] = useState(true);
   const auditCounter = useRef(200);
 
-  const cases = casesByMode[mode];
+  const liveCases = useMemo<WorkbenchCase[]>(() => {
+    const conversations = new Map<string, LineInboxEvent[]>();
+    for (const event of lineInbox) {
+      if (event.eventType !== "message" || !event.messageText) continue;
+      const key = event.sourceId ?? `unknown-${event.id}`;
+      const messages = conversations.get(key) ?? [];
+      messages.push(event);
+      conversations.set(key, messages);
+    }
+
+    return Array.from(conversations.entries()).map(([sourceId, events]) => {
+      const ordered = [...events].sort((left, right) => left.eventTimestamp - right.eventTimestamp);
+      const latest = ordered[ordered.length - 1];
+      return {
+        id: `LIVE-${sourceId}`,
+        kind: "live",
+        sourceId: latest.sourceId,
+        customer: `LINE 使用者 ${maskLineId(latest.sourceId)}`,
+        title: "LINE 即時訊息",
+        waiting: formatWaitingTime(latest.eventTimestamp),
+        tag: "真實 LINE",
+        intent: "待人工判讀",
+        urgency: "待確認",
+        risk: "尚未分類",
+        confidence: 0,
+        observation: "這是已通過 LINE 簽章驗證並寫入資料庫的真實訊息，目前尚未進行內容判讀。",
+        why: "工作台只確認訊息來源與完整性；在資訊不足時，不會把單一句話猜成商品、報價或售後需求。",
+        draft: `您好，已收到您的訊息「${latest.messageText}」。請問您想詢問燈具選購、報價、安裝，還是售後服務呢？`,
+        messages: ordered.map((event) => ({
+          side: "customer" as const,
+          time: formatMessageTime(event.eventTimestamp),
+          text: event.messageText ?? "（此事件沒有文字內容）",
+        })),
+        sources: [{
+          label: "LINE 已驗證事件",
+          excerpt: `${formatLineTime(latest.eventTimestamp)} 收到；來源 ${maskLineId(latest.sourceId)}。`,
+        }],
+      };
+    }).sort((left, right) => {
+      const leftTime = conversations.get(left.sourceId ?? "")?.at(-1)?.eventTimestamp ?? 0;
+      const rightTime = conversations.get(right.sourceId ?? "")?.at(-1)?.eventTimestamp ?? 0;
+      return rightTime - leftTime;
+    });
+  }, [lineInbox]);
+
+  const demoCases = useMemo<WorkbenchCase[]>(() => casesByMode[mode].map((item) => ({ ...item, kind: "demo" })), [mode]);
+  const cases = mode === "retail" && liveCases.length > 0 ? liveCases : demoCases;
   const selected = cases.find((item) => item.id === selectedId) ?? cases[0];
+  const currentDraft = selected.id === selectedId ? draft : selected.draft;
 
   useEffect(() => {
     window.queueMicrotask(() => {
@@ -66,17 +130,19 @@ export default function ReplyLedger() {
 
   useEffect(() => {
     let active = true;
-    Promise.all([
-      fetch("/api/line/status", { headers: { accept: "application/json" } }).then(async (response) => response.ok ? await response.json() as LineStatus : null),
-      fetch("/api/line/inbox?limit=50", { headers: { accept: "application/json" } }).then(async (response) => response.ok ? await response.json() as { events: LineInboxEvent[] } : null),
-    ]).then(([statusResult, inboxResult]) => {
+    async function loadLineData() {
+      const [statusResult, inboxResult] = await Promise.all([
+        fetch("/api/line/status", { headers: { accept: "application/json" } }).then(async (response) => response.ok ? await response.json() as LineStatus : null),
+        fetch("/api/line/inbox?limit=50", { headers: { accept: "application/json" } }).then(async (response) => response.ok ? await response.json() as { events: LineInboxEvent[] } : null),
+      ]);
       if (!active) return;
-      if (statusResult) setLineStatus(statusResult as LineStatus);
-      if (inboxResult?.events) setLineInbox(inboxResult.events as LineInboxEvent[]);
-    }).finally(() => {
-      if (active) setLineLoading(false);
-    });
-    return () => { active = false; };
+      if (statusResult) setLineStatus(statusResult);
+      if (inboxResult?.events) setLineInbox(inboxResult.events);
+      setLineLoading(false);
+    }
+    void loadLineData();
+    const refreshTimer = window.setInterval(() => void loadLineData(), 10_000);
+    return () => { active = false; window.clearInterval(refreshTimer); };
   }, []);
 
   useEffect(() => {
@@ -86,8 +152,11 @@ export default function ReplyLedger() {
 
   function changeMode(nextMode: Mode) {
     setMode(nextMode);
-    setSelectedId(casesByMode[nextMode][0].id);
-    setDraft(casesByMode[nextMode][0].draft);
+    const nextCases = nextMode === "retail" && liveCases.length > 0
+      ? liveCases
+      : casesByMode[nextMode].map((item) => ({ ...item, kind: "demo" as const }));
+    setSelectedId(nextCases[0].id);
+    setDraft(nextCases[0].draft);
     setEditing(false);
     setView("workspace");
   }
@@ -111,14 +180,14 @@ export default function ReplyLedger() {
   }
 
   function adoptDraft() {
-    const wasEdited = draft.trim() !== selected.draft.trim();
+    const wasEdited = currentDraft.trim() !== selected.draft.trim();
     logAction(wasEdited ? "修改後採用" : "採用建議", `保留人工確認；未由 AI 自動送出。${wasEdited ? "修改內容已寫入案例簿。" : ""}`);
     if (wasEdited) {
       setLearned((items) => [{
         id: `L-${Date.now()}`,
         mode,
         title: `${selected.title} · 人工修正版`,
-        body: draft,
+        body: currentDraft,
         createdAt: "剛剛",
       }, ...items]);
     }
@@ -198,7 +267,7 @@ export default function ReplyLedger() {
       {view === "workspace" && (
         <section className="workbench" aria-label="AI 客服觀察工作台">
           <aside className="queue-panel">
-            <div className="section-label"><span>01</span><p>等待回覆</p><strong>{cases.length}</strong></div>
+            <div className="section-label"><span>01</span><p>{cases[0]?.kind === "live" ? "真實待回覆" : "示範案例"}</p><strong>{cases.length}</strong></div>
             {cases.map((item) => (
               <button className={`queue-item ${item.id === selected.id ? "active" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); }}>
                 <span className="queue-topline"><span className={item.requiresHuman ? "risk-tag" : ""}>{item.tag}</span><time>{item.waiting}</time></span>
@@ -206,12 +275,12 @@ export default function ReplyLedger() {
                 <span>{item.messages[item.messages.length - 1].text}</span>
               </button>
             ))}
-            <footer className="queue-footer"><span>今日 18 件</span><span>平均等待 7m 42s</span></footer>
+            <footer className="queue-footer"><span>{cases[0]?.kind === "live" ? `真實 LINE · ${cases.length} 位` : "DEMO · 非真實訊息"}</span><span>{cases[0]?.kind === "live" ? "即時同步" : "示範模式"}</span></footer>
           </aside>
 
           <section className="conversation-panel">
             <div className="conversation-head">
-              <div><p className="eyebrow">LINE · {selected.customer}</p><h2>{selected.title}</h2></div>
+              <div><p className="eyebrow">{selected.kind === "live" ? "LIVE LINE" : "DEMO LINE"} · {selected.customer}</p><h2>{selected.title}</h2></div>
               <span className="case-number">CASE {selected.id}</span>
             </div>
             <div className="messages">
@@ -226,7 +295,7 @@ export default function ReplyLedger() {
           </section>
 
           <aside className={`advice-panel ${paused ? "is-paused" : ""}`}>
-            <div className="section-label"><span>02</span><p>建議回覆</p><strong className="confidence">{selected.confidence}%</strong></div>
+            <div className="section-label"><span>02</span><p>建議回覆</p><strong className="confidence">{selected.kind === "live" ? "待判讀" : `${selected.confidence}%`}</strong></div>
             {paused && <div className="pause-notice"><strong>AI 觀察已暫停</strong><p>既有分析仍保留，但不會產生新建議。</p></div>}
             <div className="analysis-grid">
               <div><span>意圖</span><strong>{selected.intent}</strong></div>
@@ -236,8 +305,8 @@ export default function ReplyLedger() {
             <div className="draft-block">
               <p className="margin-label">DRAFT / HUMAN REVIEW REQUIRED</p>
               {editing ? (
-                <textarea aria-label="修改建議回覆" value={draft} onChange={(event) => setDraft(event.target.value)} rows={11} />
-              ) : <blockquote>{draft}</blockquote>}
+                <textarea aria-label="修改建議回覆" value={currentDraft} onChange={(event) => { if (selected.id !== selectedId) setSelectedId(selected.id); setDraft(event.target.value); }} rows={11} />
+              ) : <blockquote>{currentDraft}</blockquote>}
             </div>
             <details className="sources" open>
               <summary>根據 · {selected.sources.length} 份</summary>
@@ -248,7 +317,7 @@ export default function ReplyLedger() {
             {selected.requiresHuman && <button className="handoff-banner" type="button" onClick={handToHuman}><strong>高風險事件</strong><span>交給真人處理 →</span></button>}
             <div className="decision-row" aria-label="回覆決策">
               <button type="button" className="primary-action" onClick={adoptDraft} disabled={paused}>採用，交真人確認</button>
-              <button type="button" onClick={() => setEditing(!editing)}>{editing ? "完成修改" : "修改"}</button>
+              <button type="button" onClick={() => { if (selected.id !== selectedId) { setSelectedId(selected.id); setDraft(selected.draft); } setEditing(!editing); }}>{editing ? "完成修改" : "修改"}</button>
               <button type="button" onClick={rejectDraft}>拒絕</button>
             </div>
             <button className="quiet-handoff" type="button" onClick={handToHuman}>不使用建議，直接交給真人</button>
