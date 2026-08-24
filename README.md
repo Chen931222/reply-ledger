@@ -106,6 +106,19 @@ actions tied to the current ChatGPT user. Leave public content anonymous.
 - `npm test`: build the product and verify rendering plus LINE signature handling
 - `npm run db:generate`: generate Drizzle migrations after schema changes
 
+## Three-Minute Demo
+
+The Traditional Chinese narration, burned-in subtitle track, and reproducible
+FFmpeg render script live in `demo/`. After capturing the five production
+screens into `H:\ReplyLedgerDemo`, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\demo\render-demo.ps1
+```
+
+The script produces a 1920×1080, 30 fps, exactly three-minute H.264/AAC video at
+`H:\ReplyLedgerDemo\reply-ledger-demo-3min.mp4`.
+
 ## Learn More
 
 - [vinext Documentation](https://github.com/cloudflare/vinext)
