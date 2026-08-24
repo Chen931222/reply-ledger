@@ -436,8 +436,9 @@ export default function ReplyLedger() {
             {cases.map((item) => (
               <button className={`queue-item ${item.id === selected.id ? "active" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }}>
                 <span className="queue-topline"><span className={item.requiresHuman ? "risk-tag" : ""}>{item.tag}</span><time>{item.waiting}</time></span>
-                <strong>{item.customer}</strong>
-                <span>{item.messages[item.messages.length - 1].text}</span>
+                <strong>{item.kind === "live" ? "LINE 聯絡人" : item.customer}</strong>
+                {item.kind === "live" && <small className="queue-identity">{maskLineId(item.sourceId ?? null)}</small>}
+                <span className="queue-preview">{item.messages[item.messages.length - 1].text}</span>
               </button>
             ))}
             <footer className="queue-footer"><span>{cases[0]?.kind === "live" ? `真實 LINE · ${cases.length} 位` : "DEMO · 非真實訊息"}</span><span>{cases[0]?.kind === "live" ? "即時同步" : "示範模式"}</span></footer>
@@ -445,13 +446,14 @@ export default function ReplyLedger() {
 
           <section className="conversation-panel">
             <div className="conversation-head">
-              <div><p className="eyebrow">{selected.kind === "live" ? "LIVE LINE" : "DEMO LINE"} · {selected.customer}</p><h2>{selected.title}</h2></div>
+              <div><p className="eyebrow">{selected.kind === "live" ? `LIVE LINE · ${maskLineId(selected.sourceId ?? null)}` : `DEMO LINE · ${selected.customer}`}</p><h2>{selected.title}</h2></div>
               <span className="case-number">CASE {selected.id}</span>
             </div>
             <div className="messages">
               {selected.messages.map((message, index) => (
                 <div className={`message-row ${message.side}`} key={`${selected.id}-${index}`}>
-                  <time>{message.time}</time><p>{message.text}</p>
+                  <div className="message-meta"><time>{message.time}</time><span>{message.side === "staff" ? "BREME" : "客戶"}</span></div>
+                  <p>{message.text}</p>
                 </div>
               ))}
             </div>
