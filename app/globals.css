@@ -99,6 +99,12 @@ h1 {
 .draft-block { padding: 28px 24px 24px; }
 .margin-label { margin: 0 0 14px; color: var(--accent); font-size: 9px; }
 blockquote { margin: 0; font-family: "Noto Serif TC", "PMingLiU", serif; font-size: clamp(17px, 1.4vw, 22px); line-height: 1.85; letter-spacing: .01em; }
+.line-message-card { overflow: hidden; border: 1px solid var(--ink); background: #f4f0e7; box-shadow: 8px 8px 0 var(--ink); }
+.line-message-card header { display: grid; gap: 7px; padding: 17px 18px; background: var(--ink); color: var(--white); }
+.line-message-card header span { color: var(--accent); font: 700 8px/1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .12em; }
+.line-message-card header strong { font: 600 18px/1.2 "Noto Serif TC", "PMingLiU", serif; }
+.line-message-card > p { margin: 0; padding: 20px 18px; white-space: pre-wrap; font: 16px/1.85 "Noto Serif TC", "PMingLiU", serif; }
+.line-message-card footer { margin: 0 18px; padding: 13px 0 16px; border-top: 1px solid var(--line); color: var(--muted); font: 8px/1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }
 .sources { margin: 0 24px; padding: 20px 0; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--line); }
 .sources a { display: block; padding: 6px 0; color: var(--ink); text-decoration: none; font-size: 11px; }
 .sources a:hover { color: var(--accent); }
@@ -348,6 +354,10 @@ button { color: inherit; }
 .live-inbox-row b { display: block; margin-bottom: 6px; font: 600 17px/1.2 "Noto Serif TC", "PMingLiU", serif; }
 .live-inbox-row p { margin: 0; font-size: 12px; line-height: 1.7; }
 .live-inbox-row em { color: var(--accent); font-style: normal; }
+.outbox-head { margin-top: 22px; }
+.outbox-row { background: rgba(255,255,255,.22); }
+.outbox-status.status-sent { color: #256b5a; }
+.outbox-status.status-failed, .outbox-status.status-rejected { color: var(--accent); }
 .privacy-note { max-width: 920px; margin: 34px 0 0; color: var(--muted); font-size: 10px; line-height: 1.8; }
 .toast {
   position: fixed;

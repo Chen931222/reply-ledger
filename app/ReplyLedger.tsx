@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { casesByMode, knowledgeByMode, modeInfo, seededAudit, type LedgerCase, type Mode, type View } from "./data";
 
 type AuditRecord = (typeof seededAudit)[number];
@@ -24,9 +24,24 @@ type LineInboxEvent = {
   eventTimestamp: number;
   isRedelivery: boolean;
 };
+type LineOutboxMessage = {
+  requestId: string;
+  targetId: string;
+  messageText: string;
+  actorId: string;
+  actorEmail: string | null;
+  status: "pending" | "sent" | "failed" | "rejected";
+  lineRequestId: string | null;
+  errorMessage: string | null;
+  createdTimestamp: number;
+  sentTimestamp: number | null;
+};
 type WorkbenchCase = LedgerCase & {
   kind: "live" | "demo";
   sourceId?: string | null;
+  revision?: string;
+  latestActivityTimestamp?: number;
+  pendingReply?: boolean;
 };
 type SendState = "idle" | "confirming" | "sending" | "sent" | "error";
 
@@ -45,6 +60,28 @@ function formatWaitingTime(timestamp: number) {
   return `${Math.floor(hours / 24)} 天`;
 }
 
+async function fetchLineSnapshot() {
+  try {
+    const [statusResponse, inboxResponse, outboxResponse] = await Promise.all([
+      fetch("/api/line/status", { headers: { accept: "application/json" } }),
+      fetch("/api/line/inbox?limit=50", { headers: { accept: "application/json" } }),
+      fetch("/api/line/outbox?limit=50", { headers: { accept: "application/json" } }),
+    ]);
+    const status = statusResponse.ok ? await statusResponse.json() as LineStatus : null;
+    const inbox = inboxResponse.ok ? await inboxResponse.json() as { events: LineInboxEvent[] } : null;
+    const outbox = outboxResponse.ok ? await outboxResponse.json() as { messages: LineOutboxMessage[] } : null;
+    const failed = [statusResponse, inboxResponse, outboxResponse].filter((response) => !response.ok);
+    return {
+      status,
+      inbox: inbox?.events ?? null,
+      outbox: outbox?.messages ?? null,
+      error: failed.length > 0 ? "部分 LINE 資料暫時無法更新；目前保留上次成功讀取的內容。" : "",
+    };
+  } catch {
+    return { status: null, inbox: null, outbox: null, error: "LINE 連線暫時中斷；目前保留上次成功讀取的內容。" };
+  }
+}
+
 export default function ReplyLedger() {
   const [mode, setMode] = useState<Mode>("retail");
   const [view, setView] = useState<View>("workspace");
@@ -60,11 +97,15 @@ export default function ReplyLedger() {
   const [newRule, setNewRule] = useState("");
   const [lineStatus, setLineStatus] = useState<LineStatus | null>(null);
   const [lineInbox, setLineInbox] = useState<LineInboxEvent[]>([]);
+  const [lineOutbox, setLineOutbox] = useState<LineOutboxMessage[]>([]);
   const [lineLoading, setLineLoading] = useState(true);
+  const [lineError, setLineError] = useState("");
   const [sendState, setSendState] = useState<SendState>("idle");
   const [sendError, setSendError] = useState("");
+  const [sendRetryable, setSendRetryable] = useState(false);
   const auditCounter = useRef(200);
   const sendRequestId = useRef<string | null>(null);
+  const selectedRevision = useRef("");
 
   const liveCases = useMemo<WorkbenchCase[]>(() => {
     const conversations = new Map<string, LineInboxEvent[]>();
@@ -79,14 +120,38 @@ export default function ReplyLedger() {
     return Array.from(conversations.entries()).map(([sourceId, events]) => {
       const ordered = [...events].sort((left, right) => left.eventTimestamp - right.eventTimestamp);
       const latest = ordered[ordered.length - 1];
+      const outbound = lineOutbox
+        .filter((message) => message.targetId === sourceId && message.status === "sent")
+        .map((message) => ({
+          side: "staff" as const,
+          time: formatMessageTime(message.sentTimestamp ?? message.createdTimestamp),
+          text: message.messageText,
+          timestamp: message.sentTimestamp ?? message.createdTimestamp,
+          key: `OUT-${message.requestId}`,
+        }));
+      const timeline = [
+        ...ordered.map((event) => ({
+          side: "customer" as const,
+          time: formatMessageTime(event.eventTimestamp),
+          text: event.messageText ?? "（此事件沒有文字內容）",
+          timestamp: event.eventTimestamp,
+          key: `IN-${event.webhookEventId}`,
+        })),
+        ...outbound,
+      ].sort((left, right) => left.timestamp - right.timestamp || left.key.localeCompare(right.key));
+      const latestActivity = timeline[timeline.length - 1];
+      const pendingReply = latestActivity?.side === "customer";
       return {
         id: `LIVE-${sourceId}`,
         kind: "live",
         sourceId: latest.sourceId,
+        revision: latest.webhookEventId,
+        latestActivityTimestamp: latestActivity?.timestamp ?? latest.eventTimestamp,
+        pendingReply,
         customer: `LINE 使用者 ${maskLineId(latest.sourceId)}`,
         title: "LINE 即時訊息",
-        waiting: formatWaitingTime(latest.eventTimestamp),
-        tag: "真實 LINE",
+        waiting: formatWaitingTime(latestActivity?.timestamp ?? latest.eventTimestamp),
+        tag: pendingReply ? "真實 LINE" : "已回覆",
         intent: "待人工判讀",
         urgency: "待確認",
         risk: "尚未分類",
@@ -94,27 +159,22 @@ export default function ReplyLedger() {
         observation: "這是已通過 LINE 簽章驗證並寫入資料庫的真實訊息，目前尚未進行內容判讀。",
         why: "工作台只確認訊息來源與完整性；在資訊不足時，不會把單一句話猜成商品、報價或售後需求。",
         draft: `您好，已收到您的訊息「${latest.messageText}」。請問您想詢問燈具選購、報價、安裝，還是售後服務呢？`,
-        messages: ordered.map((event) => ({
-          side: "customer" as const,
-          time: formatMessageTime(event.eventTimestamp),
-          text: event.messageText ?? "（此事件沒有文字內容）",
-        })),
+        messages: timeline.map(({ side, time, text }) => ({ side, time, text })),
         sources: [{
           label: "LINE 已驗證事件",
           excerpt: `${formatLineTime(latest.eventTimestamp)} 收到；來源 ${maskLineId(latest.sourceId)}。`,
         }],
       };
     }).sort((left, right) => {
-      const leftTime = conversations.get(left.sourceId ?? "")?.at(-1)?.eventTimestamp ?? 0;
-      const rightTime = conversations.get(right.sourceId ?? "")?.at(-1)?.eventTimestamp ?? 0;
-      return rightTime - leftTime;
+      return (right.latestActivityTimestamp ?? 0) - (left.latestActivityTimestamp ?? 0);
     });
-  }, [lineInbox]);
+  }, [lineInbox, lineOutbox]);
 
   const demoCases = useMemo<WorkbenchCase[]>(() => casesByMode[mode].map((item) => ({ ...item, kind: "demo" })), [mode]);
   const cases = mode === "retail" && liveCases.length > 0 ? liveCases : demoCases;
   const selected = cases.find((item) => item.id === selectedId) ?? cases[0];
   const currentDraft = selected.id === selectedId ? draft : selected.draft;
+  const pendingCount = cases.filter((item) => item.kind === "live" && item.pendingReply).length;
 
   useEffect(() => {
     window.queueMicrotask(() => {
@@ -135,19 +195,40 @@ export default function ReplyLedger() {
   useEffect(() => {
     let active = true;
     async function loadLineData() {
-      const [statusResult, inboxResult] = await Promise.all([
-        fetch("/api/line/status", { headers: { accept: "application/json" } }).then(async (response) => response.ok ? await response.json() as LineStatus : null),
-        fetch("/api/line/inbox?limit=50", { headers: { accept: "application/json" } }).then(async (response) => response.ok ? await response.json() as { events: LineInboxEvent[] } : null),
-      ]);
+      const result = await fetchLineSnapshot();
       if (!active) return;
-      if (statusResult) setLineStatus(statusResult);
-      if (inboxResult?.events) setLineInbox(inboxResult.events);
+      if (result.status) setLineStatus(result.status);
+      if (result.inbox) setLineInbox(result.inbox);
+      if (result.outbox) setLineOutbox(result.outbox);
+      setLineError(result.error);
       setLineLoading(false);
     }
     void loadLineData();
     const refreshTimer = window.setInterval(() => void loadLineData(), 10_000);
     return () => { active = false; window.clearInterval(refreshTimer); };
   }, []);
+
+  const refreshLineData = useCallback(async () => {
+    const result = await fetchLineSnapshot();
+    if (result.status) setLineStatus(result.status);
+    if (result.inbox) setLineInbox(result.inbox);
+    if (result.outbox) setLineOutbox(result.outbox);
+    setLineError(result.error);
+    setLineLoading(false);
+  }, []);
+
+  useEffect(() => {
+    const revision = `${selected.id}:${selected.revision ?? "demo"}`;
+    if (selectedRevision.current === revision) return;
+    selectedRevision.current = revision;
+    setSelectedId(selected.id);
+    setDraft(selected.draft);
+    setEditing(false);
+    setSendState("idle");
+    setSendError("");
+    setSendRetryable(false);
+    sendRequestId.current = null;
+  }, [selected.draft, selected.id, selected.revision]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -164,6 +245,7 @@ export default function ReplyLedger() {
     setEditing(false);
     setSendState("idle");
     setSendError("");
+    setSendRetryable(false);
     sendRequestId.current = null;
     setView("workspace");
   }
@@ -201,6 +283,7 @@ export default function ReplyLedger() {
     }
     setEditing(false);
     setSendError("");
+    setSendRetryable(false);
     sendRequestId.current = crypto.randomUUID();
     setSendState("confirming");
   }
@@ -219,14 +302,15 @@ export default function ReplyLedger() {
           requestId: sendRequestId.current,
         }),
       });
-      const result = await response.json().catch(() => null) as { error?: string } | null;
+      const result = await response.json().catch(() => null) as { error?: string; retryable?: boolean } | null;
       if (!response.ok) {
         if (response.status === 409) throw new Error("這次傳送請求已處理過，請先到 LINE 確認是否收到，避免重複傳送。");
-        throw new Error(result?.error ?? "LINE 沒有接受這則訊息。");
+        const failure = new Error(result?.error ?? "LINE 沒有接受這則訊息。") as Error & { retryable?: boolean };
+        failure.retryable = result?.retryable === true;
+        throw failure;
       }
 
       const wasEdited = currentDraft.trim() !== selected.draft.trim();
-      logAction("已傳送 LINE", `${wasEdited ? "人工修改後傳送" : "採用建議後傳送"}；收件人 ${maskLineId(selected.sourceId)}。`);
       if (wasEdited) {
         setLearned((items) => [{
           id: `L-${Date.now()}`,
@@ -237,9 +321,12 @@ export default function ReplyLedger() {
         }, ...items]);
       }
       setSendState("sent");
+      setSendRetryable(false);
+      await refreshLineData();
       flash("訊息已由 LINE 官方帳號成功傳送。");
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "傳送失敗，請稍後再試。");
+      setSendRetryable(Boolean(error && typeof error === "object" && "retryable" in error && error.retryable));
       setSendState("error");
     }
   }
@@ -248,6 +335,7 @@ export default function ReplyLedger() {
     logAction("拒絕建議", "建議未送出；保留原始內容供後續檢討。 ");
     setSendState("idle");
     setSendError("");
+    setSendRetryable(false);
     sendRequestId.current = null;
     flash("已拒絕。這則建議不會被送出，也不會自動學習。");
   }
@@ -266,6 +354,31 @@ export default function ReplyLedger() {
   }
 
   const modeLearned = useMemo(() => learned.filter((item) => item.mode === mode), [learned, mode]);
+  const auditEntries = useMemo<AuditRecord[]>(() => {
+    const durableTargets = new Set(lineOutbox.map((message) => `LIVE-${message.targetId}`));
+    const localEntries = audit.filter((entry) => !(entry.action === "已傳送 LINE" && durableTargets.has(entry.caseId)));
+    const durableEntries = lineOutbox.map((message) => {
+      const timestamp = message.sentTimestamp ?? message.createdTimestamp;
+      const action = message.status === "sent"
+        ? "已傳送 LINE"
+        : message.status === "rejected"
+          ? "LINE 拒絕訊息"
+          : message.status === "failed"
+            ? "LINE 傳送失敗"
+            : "LINE 傳送中";
+      return {
+        id: `OUT-${message.requestId}`,
+        time: formatMessageTime(timestamp),
+        actor: message.actorEmail ?? message.actorId,
+        action,
+        caseId: `LIVE-${message.targetId}`,
+        detail: message.status === "sent"
+          ? `真人確認後送出；收件人 ${maskLineId(message.targetId)}。`
+          : message.errorMessage ?? "等待 LINE 回應。",
+      };
+    });
+    return [...durableEntries, ...localEntries];
+  }, [audit, lineOutbox]);
   const lineState = lineStatus?.receiveReady ? (lineStatus.eventCount > 0 ? "live" : "ready") : "demo";
   const lineStateLabel = lineState === "live" ? "LINE 已連線" : lineState === "ready" ? "LINE 待測試" : modeInfo[mode].status;
 
@@ -312,16 +425,16 @@ export default function ReplyLedger() {
 
       <button className={`integration-strip state-${lineState}`} type="button" onClick={() => setView("line")}>
         <span className="integration-kicker">CONNECTION</span>
-        <strong>{lineLoading ? "目前顯示 Demo 資料，正在確認 LINE 狀態" : lineState === "live" ? `已收到 ${lineStatus?.eventCount ?? 0} 個真實事件` : lineState === "ready" ? "Webhook 已設定，等待第一則真實訊息" : "目前顯示 Demo 資料，尚未連接 LINE 官方帳號"}</strong>
+        <strong>{lineError || (lineLoading ? "目前顯示 Demo 資料，正在確認 LINE 狀態" : lineState === "live" ? `已收到 ${lineStatus?.eventCount ?? 0} 個真實事件` : lineState === "ready" ? "Webhook 已設定，等待第一則真實訊息" : "目前顯示 Demo 資料，尚未連接 LINE 官方帳號")}</strong>
         <span>{lineStatus?.sendReady ? "人工傳送已備妥" : "傳送功能鎖定"} →</span>
       </button>
 
       {view === "workspace" && (
         <section className="workbench" aria-label="AI 客服觀察工作台">
           <aside className="queue-panel">
-            <div className="section-label"><span>01</span><p>{cases[0]?.kind === "live" ? "真實待回覆" : "示範案例"}</p><strong>{cases.length}</strong></div>
+            <div className="section-label"><span>01</span><p>{cases[0]?.kind === "live" ? "真實待回覆" : "示範案例"}</p><strong>{cases[0]?.kind === "live" ? pendingCount : cases.length}</strong></div>
             {cases.map((item) => (
-              <button className={`queue-item ${item.id === selected.id ? "active" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); setSendState("idle"); setSendError(""); sendRequestId.current = null; }}>
+              <button className={`queue-item ${item.id === selected.id ? "active" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }}>
                 <span className="queue-topline"><span className={item.requiresHuman ? "risk-tag" : ""}>{item.tag}</span><time>{item.waiting}</time></span>
                 <strong>{item.customer}</strong>
                 <span>{item.messages[item.messages.length - 1].text}</span>
@@ -357,7 +470,13 @@ export default function ReplyLedger() {
             <div className="draft-block">
               <p className="margin-label">DRAFT / HUMAN REVIEW REQUIRED</p>
               {editing ? (
-                <textarea aria-label="修改建議回覆" value={currentDraft} onChange={(event) => { if (selected.id !== selectedId) setSelectedId(selected.id); setDraft(event.target.value); setSendState("idle"); setSendError(""); sendRequestId.current = null; }} rows={11} />
+                <textarea aria-label="修改建議回覆" value={currentDraft} onChange={(event) => { if (selected.id !== selectedId) setSelectedId(selected.id); setDraft(event.target.value); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }} rows={11} />
+              ) : selected.kind === "live" ? (
+                <div className="line-message-card" aria-label="LINE 客戶預覽">
+                  <header><span>LIGHTING CONCIERGE</span><strong>BREME 燈飾顧問</strong></header>
+                  <p>{currentDraft}</p>
+                  <footer>REPLY LEDGER · 將由真人確認</footer>
+                </div>
               ) : <blockquote>{currentDraft}</blockquote>}
             </div>
             <details className="sources" open>
@@ -374,14 +493,14 @@ export default function ReplyLedger() {
                 <p id="send-confirmation-copy" className="send-confirmation-copy">{currentDraft.trim()}</p>
                 {sendError && <p className="send-error" role="alert">{sendError}</p>}
                 <div className="send-confirmation-actions">
-                  <button type="button" onClick={() => { setSendState("idle"); setSendError(""); sendRequestId.current = null; }} disabled={sendState === "sending"}>返回修改</button>
-                  <button type="button" className="primary-action" onClick={confirmLineSend} disabled={sendState === "sending"}>{sendState === "sending" ? "傳送中…" : sendState === "error" ? "重新確認傳送" : "確認，現在傳送"}</button>
+                  <button type="button" onClick={() => { setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }} disabled={sendState === "sending"}>返回修改</button>
+                  {(sendState !== "error" || sendRetryable) && <button type="button" className="primary-action" onClick={confirmLineSend} disabled={sendState === "sending"}>{sendState === "sending" ? "傳送中…" : sendState === "error" ? "使用相同金鑰安全重試" : "確認，現在傳送"}</button>}
                 </div>
               </section>
             )}
             <div className="decision-row" aria-label="回覆決策">
-              <button type="button" className="primary-action" onClick={prepareLineSend} disabled={paused || selected.kind !== "live" || sendState === "sending" || sendState === "sent"}>{sendState === "sent" ? "已傳送到 LINE" : selected.kind === "live" ? "確認並傳送到 LINE" : "示範案例不可傳送"}</button>
-              <button type="button" onClick={() => { if (selected.id !== selectedId) { setSelectedId(selected.id); setDraft(selected.draft); } setSendState("idle"); setSendError(""); sendRequestId.current = null; setEditing(!editing); }}>{editing ? "完成修改" : "修改"}</button>
+              <button type="button" className="primary-action" onClick={prepareLineSend} disabled={paused || selected.kind !== "live" || selected.pendingReply === false || sendState === "sending" || sendState === "sent"}>{sendState === "sent" ? "已傳送到 LINE" : selected.kind === "live" && selected.pendingReply === false ? "最新訊息已回覆" : selected.kind === "live" ? "確認並傳送到 LINE" : "示範案例不可傳送"}</button>
+              <button type="button" onClick={() => { if (selected.id !== selectedId) { setSelectedId(selected.id); setDraft(selected.draft); } setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; setEditing(!editing); }}>{editing ? "完成修改" : "修改"}</button>
               <button type="button" onClick={rejectDraft}>拒絕</button>
             </div>
             <button className="quiet-handoff" type="button" onClick={handToHuman}>不使用建議，直接交給真人</button>
@@ -415,6 +534,17 @@ export default function ReplyLedger() {
             </div>
           )}
           <p className="privacy-note">僅保存營運所需欄位，不保存 LINE Webhook 原始內容或 reply token。診所模式在完成個資與醫療流程審查前，不應接入真實患者資料。</p>
+          <div className="live-inbox-head outbox-head"><p>真人確認後送出</p><span>{lineOutbox.length} / 最近 50 筆</span></div>
+          {lineOutbox.length === 0 ? <div className="empty-state">尚未留下正式傳送紀錄。</div> : (
+            <div className="live-inbox-list">
+              {lineOutbox.map((message) => <article className="live-inbox-row outbox-row" key={message.requestId}>
+                <time>{formatLineTime(message.sentTimestamp ?? message.createdTimestamp)}</time>
+                <span>{maskLineId(message.targetId)}</span>
+                <div><b>BREME 卡片回覆</b><p>{message.messageText}</p></div>
+                <em className={`outbox-status status-${message.status}`}>{message.status === "sent" ? "SENT" : message.status.toUpperCase()}</em>
+              </article>)}
+            </div>
+          )}
         </section>
       )}
 
@@ -431,10 +561,10 @@ export default function ReplyLedger() {
 
       {view === "audit" && (
         <section className="page-sheet audit-view">
-          <div className="page-title"><div><p className="eyebrow">AUDIT TRAIL · APPEND ONLY</p><h2>好的決定與壞消息，都留得住。</h2></div><span className="audit-count">{audit.length} EVENTS</span></div>
+          <div className="page-title"><div><p className="eyebrow">AUDIT TRAIL · APPEND ONLY</p><h2>好的決定與壞消息，都留得住。</h2></div><span className="audit-count">{auditEntries.length} EVENTS</span></div>
           <div className="audit-table" aria-label="稽核紀錄">
             <div className="audit-row audit-head"><span>時間</span><span>案件</span><span>操作者</span><span>動作與理由</span></div>
-            {audit.map((item) => <article className="audit-row" key={item.id}><time>{item.time}</time><strong>{item.caseId}</strong><span>{item.actor}</span><div><b>{item.action}</b><p>{item.detail}</p></div></article>)}
+            {auditEntries.map((item) => <article className="audit-row" key={item.id}><time>{item.time}</time><strong>{item.caseId}</strong><span>{item.actor}</span><div><b>{item.action}</b><p>{item.detail}</p></div></article>)}
           </div>
         </section>
       )}
