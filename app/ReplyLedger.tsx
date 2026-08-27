@@ -36,6 +36,21 @@ type LineOutboxMessage = {
   createdTimestamp: number;
   sentTimestamp: number | null;
 };
+type LineConversationSummary = {
+  sourceId: string;
+  sourceType: string | null;
+  lastMessageText: string | null;
+  lastMessageDirection: "inbound" | "outbound";
+  lastMessageAt: number;
+  status: "open" | "done";
+};
+type LineConversationMessage = {
+  direction: "inbound" | "outbound";
+  messageKey: string;
+  messageText: string;
+  messageTimestamp: number;
+  status: string;
+};
 type WorkbenchCase = LedgerCase & {
   kind: "live" | "demo";
   sourceId?: string | null;
@@ -62,24 +77,43 @@ function formatWaitingTime(timestamp: number) {
 
 async function fetchLineSnapshot() {
   try {
-    const [statusResponse, inboxResponse, outboxResponse] = await Promise.all([
+    const [statusResponse, conversationsResponse, outboxResponse] = await Promise.all([
       fetch("/api/line/status", { headers: { accept: "application/json" } }),
-      fetch("/api/line/inbox?limit=50", { headers: { accept: "application/json" } }),
+      fetch("/api/line/conversations?status=all&limit=30", { headers: { accept: "application/json" } }),
       fetch("/api/line/outbox?limit=50", { headers: { accept: "application/json" } }),
     ]);
     const status = statusResponse.ok ? await statusResponse.json() as LineStatus : null;
-    const inbox = inboxResponse.ok ? await inboxResponse.json() as { events: LineInboxEvent[] } : null;
+    const conversations = conversationsResponse.ok
+      ? await conversationsResponse.json() as { conversations: LineConversationSummary[]; nextCursor: string | null }
+      : null;
     const outbox = outboxResponse.ok ? await outboxResponse.json() as { messages: LineOutboxMessage[] } : null;
-    const failed = [statusResponse, inboxResponse, outboxResponse].filter((response) => !response.ok);
+    const failed = [statusResponse, conversationsResponse, outboxResponse].filter((response) => !response.ok);
     return {
       status,
-      inbox: inbox?.events ?? null,
+      conversations: conversations?.conversations ?? null,
+      conversationCursor: conversations?.nextCursor ?? null,
       outbox: outbox?.messages ?? null,
       error: failed.length > 0 ? "部分 LINE 資料暫時無法更新；目前保留上次成功讀取的內容。" : "",
     };
   } catch {
-    return { status: null, inbox: null, outbox: null, error: "LINE 連線暫時中斷；目前保留上次成功讀取的內容。" };
+    return { status: null, conversations: null, conversationCursor: null, outbox: null, error: "LINE 連線暫時中斷；目前保留上次成功讀取的內容。" };
   }
+}
+
+async function fetchConversationMessages(sourceId: string, cursor?: string | null) {
+  const query = new URLSearchParams({ limit: "50" });
+  if (cursor) query.set("cursor", cursor);
+  const response = await fetch(`/api/line/conversations/${encodeURIComponent(sourceId)}/messages?${query}`, {
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error("無法讀取這位聯絡人的歷史訊息。");
+  return response.json() as Promise<{ messages: LineConversationMessage[]; nextCursor: string | null }>;
+}
+
+async function fetchLineInbox() {
+  const response = await fetch("/api/line/inbox?limit=50", { headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error("無法讀取 LINE 事件帳簿。");
+  return response.json() as Promise<{ events: LineInboxEvent[] }>;
 }
 
 export default function ReplyLedger() {
@@ -98,6 +132,10 @@ export default function ReplyLedger() {
   const [lineStatus, setLineStatus] = useState<LineStatus | null>(null);
   const [lineInbox, setLineInbox] = useState<LineInboxEvent[]>([]);
   const [lineOutbox, setLineOutbox] = useState<LineOutboxMessage[]>([]);
+  const [lineConversations, setLineConversations] = useState<LineConversationSummary[]>([]);
+  const [conversationCursor, setConversationCursor] = useState<string | null>(null);
+  const [messagesByConversation, setMessagesByConversation] = useState<Record<string, LineConversationMessage[]>>({});
+  const [messageCursorByConversation, setMessageCursorByConversation] = useState<Record<string, string | null>>({});
   const [lineLoading, setLineLoading] = useState(true);
   const [lineError, setLineError] = useState("");
   const [sendState, setSendState] = useState<SendState>("idle");
@@ -108,49 +146,32 @@ export default function ReplyLedger() {
   const selectedRevision = useRef("");
 
   const liveCases = useMemo<WorkbenchCase[]>(() => {
-    const conversations = new Map<string, LineInboxEvent[]>();
-    for (const event of lineInbox) {
-      if (event.eventType !== "message" || !event.messageText) continue;
-      const key = event.sourceId ?? `unknown-${event.id}`;
-      const messages = conversations.get(key) ?? [];
-      messages.push(event);
-      conversations.set(key, messages);
-    }
-
-    return Array.from(conversations.entries()).map(([sourceId, events]) => {
-      const ordered = [...events].sort((left, right) => left.eventTimestamp - right.eventTimestamp);
-      const latest = ordered[ordered.length - 1];
-      const outbound = lineOutbox
-        .filter((message) => message.targetId === sourceId && message.status === "sent")
-        .map((message) => ({
-          side: "staff" as const,
-          time: formatMessageTime(message.sentTimestamp ?? message.createdTimestamp),
-          text: message.messageText,
-          timestamp: message.sentTimestamp ?? message.createdTimestamp,
-          key: `OUT-${message.requestId}`,
-        }));
-      const timeline = [
-        ...ordered.map((event) => ({
-          side: "customer" as const,
-          time: formatMessageTime(event.eventTimestamp),
-          text: event.messageText ?? "（此事件沒有文字內容）",
-          timestamp: event.eventTimestamp,
-          key: `IN-${event.webhookEventId}`,
-        })),
-        ...outbound,
-      ].sort((left, right) => left.timestamp - right.timestamp || left.key.localeCompare(right.key));
-      const latestActivity = timeline[timeline.length - 1];
-      const pendingReply = latestActivity?.side === "customer";
+    return lineConversations.map((conversation) => {
+      const storedMessages = messagesByConversation[conversation.sourceId] ?? [];
+      const timeline = (storedMessages.length > 0 ? storedMessages : [{
+        direction: conversation.lastMessageDirection,
+        messageKey: `SUMMARY-${conversation.sourceId}`,
+        messageText: conversation.lastMessageText ?? "（此訊息沒有文字內容）",
+        messageTimestamp: conversation.lastMessageAt,
+        status: conversation.status,
+      }]).map((message) => ({
+        side: message.direction === "outbound" ? "staff" as const : "customer" as const,
+        time: formatMessageTime(message.messageTimestamp),
+        text: message.messageText,
+        timestamp: message.messageTimestamp,
+        key: message.messageKey,
+      })).sort((left, right) => left.timestamp - right.timestamp || left.key.localeCompare(right.key));
+      const pendingReply = conversation.status === "open" && conversation.lastMessageDirection === "inbound";
       return {
-        id: `LIVE-${sourceId}`,
+        id: `LIVE-${conversation.sourceId}`,
         kind: "live",
-        sourceId: latest.sourceId,
-        revision: latest.webhookEventId,
-        latestActivityTimestamp: latestActivity?.timestamp ?? latest.eventTimestamp,
+        sourceId: conversation.sourceId,
+        revision: `${conversation.lastMessageAt}:${conversation.lastMessageDirection}`,
+        latestActivityTimestamp: conversation.lastMessageAt,
         pendingReply,
-        customer: `LINE 使用者 ${maskLineId(latest.sourceId)}`,
+        customer: `LINE 使用者 ${maskLineId(conversation.sourceId)}`,
         title: "LINE 即時訊息",
-        waiting: formatWaitingTime(latestActivity?.timestamp ?? latest.eventTimestamp),
+        waiting: formatWaitingTime(conversation.lastMessageAt),
         tag: pendingReply ? "真實 LINE" : "已回覆",
         intent: "待人工判讀",
         urgency: "待確認",
@@ -158,17 +179,17 @@ export default function ReplyLedger() {
         confidence: 0,
         observation: "這是已通過 LINE 簽章驗證並寫入資料庫的真實訊息，目前尚未進行內容判讀。",
         why: "工作台只確認訊息來源與完整性；在資訊不足時，不會把單一句話猜成商品、報價或售後需求。",
-        draft: `您好，已收到您的訊息「${latest.messageText}」。請問您想詢問燈具選購、報價、安裝，還是售後服務呢？`,
+        draft: `您好，已收到您的訊息「${conversation.lastMessageText ?? ""}」。請問您想詢問燈具選購、報價、安裝，還是售後服務呢？`,
         messages: timeline.map(({ side, time, text }) => ({ side, time, text })),
         sources: [{
-          label: "LINE 已驗證事件",
-          excerpt: `${formatLineTime(latest.eventTimestamp)} 收到；來源 ${maskLineId(latest.sourceId)}。`,
+          label: "LINE 已驗證對話",
+          excerpt: `${formatLineTime(conversation.lastMessageAt)} 更新；來源 ${maskLineId(conversation.sourceId)}。`,
         }],
       };
     }).sort((left, right) => {
       return (right.latestActivityTimestamp ?? 0) - (left.latestActivityTimestamp ?? 0);
     });
-  }, [lineInbox, lineOutbox]);
+  }, [lineConversations, messagesByConversation]);
 
   const demoCases = useMemo<WorkbenchCase[]>(() => casesByMode[mode].map((item) => ({ ...item, kind: "demo" })), [mode]);
   const cases = mode === "retail" && liveCases.length > 0 ? liveCases : demoCases;
@@ -198,7 +219,8 @@ export default function ReplyLedger() {
       const result = await fetchLineSnapshot();
       if (!active) return;
       if (result.status) setLineStatus(result.status);
-      if (result.inbox) setLineInbox(result.inbox);
+      if (result.conversations) setLineConversations(result.conversations);
+      setConversationCursor(result.conversationCursor);
       if (result.outbox) setLineOutbox(result.outbox);
       setLineError(result.error);
       setLineLoading(false);
@@ -211,11 +233,79 @@ export default function ReplyLedger() {
   const refreshLineData = useCallback(async () => {
     const result = await fetchLineSnapshot();
     if (result.status) setLineStatus(result.status);
-    if (result.inbox) setLineInbox(result.inbox);
+    if (result.conversations) setLineConversations(result.conversations);
+    setConversationCursor(result.conversationCursor);
     if (result.outbox) setLineOutbox(result.outbox);
     setLineError(result.error);
     setLineLoading(false);
   }, []);
+
+  useEffect(() => {
+    if (view !== "line") return;
+    let active = true;
+    void fetchLineInbox().then((result) => {
+      if (active) setLineInbox(result.events);
+    }).catch(() => {
+      if (active) setLineError("LINE 事件帳簿暫時無法更新；工作台對話仍保留上次成功讀取的內容。");
+    });
+    return () => { active = false; };
+  }, [view, lineStatus?.eventCount]);
+
+  useEffect(() => {
+    if (selected.kind !== "live" || !selected.sourceId) return;
+    const sourceId = selected.sourceId;
+    let active = true;
+    async function loadMessages() {
+      try {
+        const result = await fetchConversationMessages(sourceId);
+        if (!active) return;
+        setMessagesByConversation((current) => ({ ...current, [sourceId]: result.messages }));
+        setMessageCursorByConversation((current) => ({ ...current, [sourceId]: result.nextCursor }));
+      } catch (error) {
+        if (active) setLineError(error instanceof Error ? error.message : "無法讀取對話紀錄。");
+      }
+    }
+    void loadMessages();
+    const refreshTimer = window.setInterval(() => void loadMessages(), 10_000);
+    return () => { active = false; window.clearInterval(refreshTimer); };
+  }, [selected.kind, selected.sourceId, selected.revision]);
+
+  async function loadMoreConversations() {
+    if (!conversationCursor) return;
+    try {
+      const response = await fetch(`/api/line/conversations?status=all&limit=30&cursor=${encodeURIComponent(conversationCursor)}`, {
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) throw new Error("無法載入更多聯絡人。");
+      const result = await response.json() as { conversations: LineConversationSummary[]; nextCursor: string | null };
+      setLineConversations((current) => {
+        const merged = new Map(current.map((item) => [item.sourceId, item]));
+        for (const item of result.conversations) merged.set(item.sourceId, item);
+        return [...merged.values()].sort((left, right) => right.lastMessageAt - left.lastMessageAt || left.sourceId.localeCompare(right.sourceId));
+      });
+      setConversationCursor(result.nextCursor);
+    } catch (error) {
+      setLineError(error instanceof Error ? error.message : "無法載入更多聯絡人。");
+    }
+  }
+
+  async function loadOlderMessages() {
+    if (selected.kind !== "live" || !selected.sourceId) return;
+    const sourceId = selected.sourceId;
+    const cursor = messageCursorByConversation[sourceId];
+    if (!cursor) return;
+    try {
+      const result = await fetchConversationMessages(sourceId, cursor);
+      setMessagesByConversation((current) => {
+        const merged = new Map((current[sourceId] ?? []).map((item) => [item.messageKey, item]));
+        for (const item of result.messages) merged.set(item.messageKey, item);
+        return { ...current, [sourceId]: [...merged.values()] };
+      });
+      setMessageCursorByConversation((current) => ({ ...current, [sourceId]: result.nextCursor }));
+    } catch (error) {
+      setLineError(error instanceof Error ? error.message : "無法載入較舊訊息。");
+    }
+  }
 
   useEffect(() => {
     const revision = `${selected.id}:${selected.revision ?? "demo"}`;
@@ -433,6 +523,10 @@ export default function ReplyLedger() {
         <section className="workbench" aria-label="AI 客服觀察工作台">
           <aside className="queue-panel">
             <div className="section-label"><span>01</span><p>{cases[0]?.kind === "live" ? "真實待回覆" : "示範案例"}</p><strong>{cases[0]?.kind === "live" ? pendingCount : cases.length}</strong></div>
+            <div className="queue-status-tabs" aria-label="案件狀態">
+              <span className="active">待處理 <b>{cases[0]?.kind === "live" ? pendingCount : cases.length}</b></span>
+              <span>已完成 <b>{lineOutbox.filter((message) => message.status === "sent").length}</b></span>
+            </div>
             {cases.map((item) => (
               <button className={`queue-item ${item.id === selected.id ? "active" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }}>
                 <span className="queue-topline"><span className={item.requiresHuman ? "risk-tag" : ""}>{item.tag}</span><time>{item.waiting}</time></span>
@@ -441,19 +535,32 @@ export default function ReplyLedger() {
                 <span className="queue-preview">{item.messages[item.messages.length - 1].text}</span>
               </button>
             ))}
+            {cases[0]?.kind === "live" && conversationCursor && (
+              <button className="pagination-button" type="button" onClick={loadMoreConversations}>載入更多對話</button>
+            )}
             <footer className="queue-footer"><span>{cases[0]?.kind === "live" ? `真實 LINE · ${cases.length} 位` : "DEMO · 非真實訊息"}</span><span>{cases[0]?.kind === "live" ? "即時同步" : "示範模式"}</span></footer>
           </aside>
 
           <section className="conversation-panel">
             <div className="conversation-head">
-              <div><p className="eyebrow">{selected.kind === "live" ? `LIVE LINE · ${maskLineId(selected.sourceId ?? null)}` : `DEMO LINE · ${selected.customer}`}</p><h2>{selected.title}</h2></div>
+              <div>
+                <div className="conversation-status"><span className="channel-chip">{selected.kind === "live" ? "LINE" : "DEMO"}</span><span className={selected.pendingReply === false ? "resolved-chip" : "waiting-chip"}>{selected.pendingReply === false ? "已處理" : "待人工處理"}</span></div>
+                <h2>{selected.title}</h2>
+                <p className="conversation-identity">{selected.kind === "live" ? maskLineId(selected.sourceId ?? null) : selected.customer}</p>
+              </div>
               <span className="case-number">CASE {selected.id}</span>
             </div>
             <div className="messages">
+              {selected.kind === "live" && selected.sourceId && messageCursorByConversation[selected.sourceId] && (
+                <button className="older-messages-button" type="button" onClick={loadOlderMessages}>↑ 載入較舊訊息</button>
+              )}
               {selected.messages.map((message, index) => (
                 <div className={`message-row ${message.side}`} key={`${selected.id}-${index}`}>
-                  <div className="message-meta"><time>{message.time}</time><span>{message.side === "staff" ? "BREME" : "客戶"}</span></div>
-                  <p>{message.text}</p>
+                  <span className="message-avatar" aria-hidden="true">{message.side === "staff" ? "B" : "客"}</span>
+                  <div className="message-content">
+                    <div className="message-meta"><strong>{message.side === "staff" ? "BREME" : selected.kind === "live" ? "LINE 客戶" : selected.customer}</strong><time>{message.time}</time></div>
+                    <p>{message.text}</p>
+                  </div>
                 </div>
               ))}
             </div>
@@ -462,15 +569,20 @@ export default function ReplyLedger() {
           </section>
 
           <aside className={`advice-panel ${paused ? "is-paused" : ""}`}>
-            <div className="section-label"><span>02</span><p>建議回覆</p><strong className="confidence">{selected.kind === "live" ? "待判讀" : `${selected.confidence}%`}</strong></div>
+            <div className="section-label"><span>02</span><p>AI 建議</p><strong className="confidence">{selected.kind === "live" ? "需覆核" : `${selected.confidence}%`}</strong></div>
             {paused && <div className="pause-notice"><strong>AI 觀察已暫停</strong><p>既有分析仍保留，但不會產生新建議。</p></div>}
+            <div className={`attention-panel ${selected.pendingReply === false ? "resolved" : ""}`}>
+              <span>{selected.pendingReply === false ? "DONE" : "NEXT ACTION"}</span>
+              <strong>{selected.pendingReply === false ? "最新訊息已經回覆" : selected.kind === "live" ? "確認客戶需求，再送出回覆" : selected.requiresHuman ? "先確認風險，再決定是否回覆" : "檢查草稿後即可採用"}</strong>
+              <p>{selected.pendingReply === false ? "完整傳送結果已保存在稽核紀錄。" : `目前風險：${selected.risk}`}</p>
+            </div>
             <div className="analysis-grid">
               <div><span>意圖</span><strong>{selected.intent}</strong></div>
               <div><span>急迫度</span><strong>{selected.urgency}</strong></div>
               <div><span>風險</span><strong className="accent-text">{selected.risk}</strong></div>
             </div>
             <div className="draft-block">
-              <p className="margin-label">DRAFT / HUMAN REVIEW REQUIRED</p>
+              <div className="draft-heading"><p>建議回覆草稿</p><span>真人覆核後送出</span></div>
               {editing ? (
                 <textarea aria-label="修改建議回覆" value={currentDraft} onChange={(event) => { if (selected.id !== selectedId) setSelectedId(selected.id); setDraft(event.target.value); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }} rows={11} />
               ) : selected.kind === "live" ? (
@@ -481,7 +593,7 @@ export default function ReplyLedger() {
                 </div>
               ) : <blockquote>{currentDraft}</blockquote>}
             </div>
-            <details className="sources" open>
+            <details className="sources">
               <summary>根據 · {selected.sources.length} 份</summary>
               {selected.sources.map((source, index) => (
                 <div className="source-row" key={source.label}><strong>0{index + 1}</strong><span><b>{source.label}</b>{source.excerpt}</span></div>

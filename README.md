@@ -27,6 +27,14 @@ This starter does not use `wrangler.jsonc`.
 - Stores only the event fields needed by the inbox; raw webhook JSON and reply tokens are not retained.
 - `/api/line/send` is authenticated, idempotent, and unavailable until a channel access token is configured.
 
+### Message storage model
+
+- `line_webhook_events` is the durable inbound event ledger. LINE text cannot be fetched again later, so verified events are written before the webhook returns success.
+- `line_outbound_messages` is the durable, idempotent send and audit ledger.
+- `line_conversations` is a compact per-contact summary used by the queue. It is updated only when a newer inbound or outbound message arrives, so redelivered older events cannot move a conversation backward.
+- `/api/line/conversations` and `/api/line/conversations/:sourceId/messages` use keyset cursors. The UI loads conversation summaries first, then only the selected contact's newest 50 messages; older pages remain available without loading the whole database into the browser.
+- Text is stored in D1. For non-text events, the event type and message ID are retained and the UI shows a typed placeholder. Downloaded attachment bytes should use R2 when that workflow is added rather than being stored in D1.
+
 Copy `.env.example` to `.env.local` for local work. Production values belong in
 Sites environment variables and must be marked secret:
 

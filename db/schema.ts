@@ -1,6 +1,19 @@
 import { sql } from "drizzle-orm";
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
+export const lineConversations = sqliteTable("line_conversations", {
+  sourceId: text("source_id").primaryKey(),
+  sourceType: text("source_type"),
+  lastMessageText: text("last_message_text"),
+  lastMessageDirection: text("last_message_direction").notNull(),
+  lastMessageAt: integer("last_message_at").notNull(),
+  status: text("status").notNull().default("open"),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_line_conversations_activity").on(table.lastMessageAt),
+  index("idx_line_conversations_status_activity").on(table.status, table.lastMessageAt),
+]);
+
 export const lineWebhookEvents = sqliteTable("line_webhook_events", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   webhookEventId: text("webhook_event_id").notNull(),

@@ -44,6 +44,8 @@ test("ships the tour and both guarded scenario sets", async () => {
   assert.match(client, /稽核紀錄/);
   assert.match(client, /\/api\/line\/send/);
   assert.match(client, /\/api\/line\/outbox/);
+  assert.match(client, /\/api\/line\/conversations\?status=all&limit=30/);
+  assert.match(client, /\/messages\?/);
   assert.match(client, /確認，現在傳送/);
   assert.match(client, /selected\.revision/);
   assert.match(client, /BREME 燈飾顧問/);
@@ -97,14 +99,24 @@ test("LINE webhook rejects spoofed requests and accepts a correctly signed verif
 
   const eventBody = JSON.stringify({
     destination: "U-bot",
-    events: [{
-      type: "message",
-      webhookEventId: "01TESTEVENT",
-      timestamp: 1787152000000,
-      deliveryContext: { isRedelivery: false },
-      source: { type: "user", userId: "U1234567890" },
-      message: { id: "999", type: "text", text: "真實測試訊息" },
-    }],
+    events: [
+      {
+        type: "message",
+        webhookEventId: "01TESTEVENT",
+        timestamp: 1787152000000,
+        deliveryContext: { isRedelivery: false },
+        source: { type: "user", userId: "U1234567890" },
+        message: { id: "999", type: "text", text: "真實測試訊息" },
+      },
+      {
+        type: "message",
+        webhookEventId: "01TESTIMAGE",
+        timestamp: 1787152001000,
+        deliveryContext: { isRedelivery: false },
+        source: { type: "user", userId: "U1234567890" },
+        message: { id: "1001", type: "image" },
+      },
+    ],
   });
   const eventSignatureBytes = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(eventBody));
   const eventSignature = Buffer.from(eventSignatureBytes).toString("base64");
@@ -116,10 +128,16 @@ test("LINE webhook rejects spoofed requests and accepts a correctly signed verif
   }), env, eventCtx);
   assert.equal(eventResponse.status, 200);
   await persistence;
-  assert.equal(storedStatements.length, 1);
+  assert.equal(storedStatements.length, 4);
   assert.deepEqual(storedStatements[0].args, [
     "01TESTEVENT", "U-bot", "message", "user", "U1234567890",
     1787152000000, 0, "text", "999", "真實測試訊息",
+  ]);
+  assert.deepEqual(storedStatements[1].args, [
+    "U1234567890", "user", "真實測試訊息", 1787152000000,
+  ]);
+  assert.deepEqual(storedStatements[3].args, [
+    "U1234567890", "user", "［圖片］", 1787152001000,
   ]);
 });
 
@@ -162,14 +180,82 @@ test("LINE webhook reports persistence failures so LINE can redeliver", async ()
   assert.deepEqual(await response.json(), { error: "Event persistence failed" });
 });
 
+test("LINE conversations and message history use stable cursor pagination", async () => {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("line-pagination-test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  const calls = [];
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            calls.push({ sql, args });
+            return {
+              async all() {
+                if (sql.includes("FROM line_conversations")) {
+                  return { results: [
+                    { sourceId: "U1234567890", sourceType: "user", lastMessageText: "最新訊息", lastMessageDirection: "inbound", lastMessageAt: 2000, status: "open" },
+                    { sourceId: "U0987654321", sourceType: "user", lastMessageText: "較舊訊息", lastMessageDirection: "outbound", lastMessageAt: 1000, status: "done" },
+                  ] };
+                }
+                if (sql.includes("WITH conversation_messages")) {
+                  return { results: [
+                    { direction: "inbound", messageKey: "IN-2", messageText: "第二則", messageTimestamp: 2000, status: "received" },
+                    { direction: "outbound", messageKey: "OUT-1", messageText: "第一則回覆", messageTimestamp: 1000, status: "sent" },
+                  ] };
+                }
+                return { results: [] };
+              },
+            };
+          },
+        };
+      },
+    },
+  };
+  const headers = { "oai-authenticated-user-id": "owner-1" };
+
+  const conversationsResponse = await worker.fetch(new Request(
+    "https://reply-ledger.example/api/line/conversations?status=all&limit=1",
+    { headers },
+  ), env, { waitUntil() {}, passThroughOnException() {} });
+  assert.equal(conversationsResponse.status, 200);
+  const conversations = await conversationsResponse.json();
+  assert.equal(conversations.conversations.length, 1);
+  assert.equal(conversations.nextCursor, "2000:U1234567890");
+
+  const messagesResponse = await worker.fetch(new Request(
+    "https://reply-ledger.example/api/line/conversations/U1234567890/messages?limit=1",
+    { headers },
+  ), env, { waitUntil() {}, passThroughOnException() {} });
+  assert.equal(messagesResponse.status, 200);
+  const messages = await messagesResponse.json();
+  assert.equal(messages.messages.length, 1);
+  assert.equal(messages.nextCursor, "2000:IN-2");
+  assert.ok(calls.some((call) => call.sql.includes("ORDER BY last_message_at DESC, source_id ASC")));
+  assert.ok(calls.some((call) => call.sql.includes("ORDER BY messageTimestamp DESC, messageKey DESC")));
+});
+
 function createOutboundDb(initialRows = []) {
   const rows = new Map(initialRows.map((row) => [row.requestId, { ...row }]));
   return {
     rows,
+    async batch(statements) {
+      for (const { sql, args } of statements) {
+        if (sql.includes("SET status = 'sent'")) {
+          const [lineRequestId, requestId] = args;
+          const row = rows.get(requestId);
+          if (row) Object.assign(row, { status: "sent", lineRequestId, sentTimestamp: Date.now(), errorMessage: null });
+        }
+      }
+      return statements.map(() => ({ meta: { changes: 1 } }));
+    },
     prepare(sql) {
       return {
         bind(...args) {
           return {
+            sql,
+            args,
             async first() {
               if (!sql.includes("FROM line_outbound_messages WHERE request_id")) return null;
               const row = rows.get(args[0]);
