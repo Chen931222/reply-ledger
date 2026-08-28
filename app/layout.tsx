@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
-import { headers } from "next/headers";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -13,15 +12,14 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-export async function generateMetadata(): Promise<Metadata> {
-  const requestHeaders = await headers();
-  const host = requestHeaders.get("host") ?? "localhost:3000";
-  const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.includes("localhost") ? "http" : "https");
-  const ogUrl = `${protocol}://${host}/og.png`;
+export function generateMetadata(): Metadata {
+  const publicOrigin = "https://reply-ledger-tw.ntumed301.chatgpt.site";
+  const ogUrl = `${publicOrigin}/og.png`;
   const title = "Reply Ledger｜回覆帳簿";
   const description = "站在客服旁邊的 AI 觀察員：分析、建議、留下根據，但不擅自替人說話。";
 
   return {
+    metadataBase: new URL(publicOrigin),
     title,
     description,
     openGraph: { title, description, images: [{ url: ogUrl, width: 1733, height: 909 }] },

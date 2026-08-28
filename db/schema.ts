@@ -1,6 +1,49 @@
 import { sql } from "drizzle-orm";
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
+export const workspaceKnowledgeRules = sqliteTable("workspace_knowledge_rules", {
+  id: text("id").primaryKey(),
+  mode: text("mode").notNull(),
+  title: text("title").notNull(),
+  body: text("body").notNull(),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  createdBy: text("created_by").notNull(),
+  createdByEmail: text("created_by_email"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_workspace_rules_mode_active_updated").on(table.mode, table.active, table.updatedAt),
+]);
+
+export const workspaceAuditEvents = sqliteTable("workspace_audit_events", {
+  id: text("id").primaryKey(),
+  occurredAt: integer("occurred_at").notNull(),
+  actorId: text("actor_id").notNull(),
+  actorEmail: text("actor_email"),
+  action: text("action").notNull(),
+  caseId: text("case_id").notNull(),
+  detail: text("detail").notNull(),
+}, (table) => [
+  index("idx_workspace_audit_occurred").on(table.occurredAt),
+]);
+
+export const conversationAnalyses = sqliteTable("conversation_analyses", {
+  sourceId: text("source_id").primaryKey(),
+  inputMessageAt: integer("input_message_at").notNull(),
+  intent: text("intent").notNull(),
+  urgency: text("urgency").notNull(),
+  risk: text("risk").notNull(),
+  confidence: integer("confidence").notNull(),
+  observation: text("observation").notNull(),
+  rationale: text("rationale").notNull(),
+  draft: text("draft").notNull(),
+  evidenceJson: text("evidence_json").notNull(),
+  model: text("model").notNull(),
+  status: text("status").notNull(),
+  errorMessage: text("error_message"),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
 export const lineConversations = sqliteTable("line_conversations", {
   sourceId: text("source_id").primaryKey(),
   sourceType: text("source_type"),

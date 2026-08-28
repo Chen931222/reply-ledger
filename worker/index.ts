@@ -8,6 +8,8 @@ interface Env {
   LINE_CHANNEL_SECRET?: string;
   LINE_CHANNEL_ACCESS_TOKEN?: string;
   LINE_WORKSPACE_MODE?: string;
+  OPENAI_API_KEY?: string;
+  OPENAI_MODEL?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -71,6 +73,21 @@ const worker = {
     if (url.pathname === "/api/line/send") {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       return handleLineSend(request, env);
+    }
+
+    if (url.pathname === "/api/workspace/knowledge") {
+      if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
+      return handleWorkspaceKnowledge(request, env);
+    }
+
+    if (url.pathname === "/api/workspace/audit") {
+      if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
+      return handleWorkspaceAudit(request, env);
+    }
+
+    if (url.pathname === "/api/ai/analyze") {
+      if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
+      return handleConversationAnalysis(request, env);
     }
 
     if (url.pathname === "/_vinext/image") {
@@ -161,6 +178,7 @@ async function handleLineStatus(request: Request, env: Env): Promise<Response> {
     databaseReady,
     receiveReady: databaseReady && Boolean(env.LINE_CHANNEL_SECRET),
     sendReady: databaseReady && Boolean(env.LINE_CHANNEL_ACCESS_TOKEN),
+    aiReady: databaseReady && Boolean(env.OPENAI_API_KEY),
     workspaceMode: env.LINE_WORKSPACE_MODE === "clinic" ? "clinic" : "retail",
     eventCount,
     lastEventAt,
@@ -351,8 +369,367 @@ async function handleLineConversationMessages(request: Request, env: Env, source
   }
 }
 
+async function handleWorkspaceKnowledge(request: Request, env: Env): Promise<Response> {
+  if (!env.DB) return json({ rules: [], error: "Database is not configured" }, 503);
+  const url = new URL(request.url);
+  const mode = url.searchParams.get("mode") === "clinic" ? "clinic" : "retail";
+
+  if (request.method === "GET") {
+    try {
+      const result = await env.DB.prepare(
+        `SELECT id, mode, title, body,
+                CAST(strftime('%s', created_at) AS INTEGER) * 1000 AS createdTimestamp,
+                CAST(strftime('%s', updated_at) AS INTEGER) * 1000 AS updatedTimestamp
+         FROM workspace_knowledge_rules
+         WHERE mode = ? AND active = 1
+         ORDER BY updated_at DESC, id ASC`,
+      ).bind(mode).all();
+      return json({ rules: result.results });
+    } catch {
+      return json({ rules: [], error: "Database migration is pending" }, 503);
+    }
+  }
+
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, { Allow: "GET, POST" });
+  if (!isSameOriginWrite(request)) return json({ error: "Invalid request origin" }, 403);
+  let body: { mode?: string; title?: string; body?: string };
+  try {
+    body = await request.json() as { mode?: string; title?: string; body?: string };
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+  const nextMode = body.mode === "clinic" ? "clinic" : body.mode === "retail" ? "retail" : "";
+  const title = body.title?.trim() ?? "";
+  const ruleBody = body.body?.trim() ?? "";
+  if (!nextMode || title.length < 2 || title.length > 120 || ruleBody.length < 4 || ruleBody.length > 3000) {
+    return json({ error: "Rule must include a valid mode, title, and 4–3000 character body" }, 400);
+  }
+  const actorId = request.headers.get("oai-authenticated-user-id") ?? "local-development";
+  const actorEmail = request.headers.get("oai-authenticated-user-email");
+  const id = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  const occurredAt = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO workspace_knowledge_rules
+        (id, mode, title, body, active, created_by, created_by_email)
+       VALUES (?, ?, ?, ?, 1, ?, ?)`,
+    ).bind(id, nextMode, title, ruleBody, actorId, actorEmail),
+    env.DB.prepare(
+      `INSERT INTO workspace_audit_events
+        (id, occurred_at, actor_id, actor_email, action, case_id, detail)
+       VALUES (?, ?, ?, ?, '新增知識規則', ?, ?)`,
+    ).bind(auditId, occurredAt, actorId, actorEmail, `KNOWLEDGE-${nextMode}`, title),
+  ]);
+  return json({ rule: { id, mode: nextMode, title, body: ruleBody, createdTimestamp: occurredAt, updatedTimestamp: occurredAt } }, 201);
+}
+
+async function handleWorkspaceAudit(request: Request, env: Env): Promise<Response> {
+  if (!env.DB) return json({ events: [], error: "Database is not configured" }, 503);
+  if (request.method === "GET") {
+    const limit = pageLimit(request, 100, 200);
+    try {
+      const result = await env.DB.prepare(
+        `SELECT id, occurred_at AS occurredAt, actor_id AS actorId,
+                actor_email AS actorEmail, action, case_id AS caseId, detail
+         FROM workspace_audit_events
+         ORDER BY occurred_at DESC, id DESC
+         LIMIT ?`,
+      ).bind(limit).all();
+      return json({ events: result.results });
+    } catch {
+      return json({ events: [], error: "Database migration is pending" }, 503);
+    }
+  }
+
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, { Allow: "GET, POST" });
+  if (!isSameOriginWrite(request)) return json({ error: "Invalid request origin" }, 403);
+  let body: { action?: string; caseId?: string; detail?: string };
+  try {
+    body = await request.json() as { action?: string; caseId?: string; detail?: string };
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+  const action = body.action?.trim() ?? "";
+  const caseId = body.caseId?.trim() ?? "";
+  const detail = body.detail?.trim() ?? "";
+  if (!action || action.length > 120 || !caseId || caseId.length > 160 || !detail || detail.length > 2000) {
+    return json({ error: "Invalid audit event" }, 400);
+  }
+  const id = crypto.randomUUID();
+  const occurredAt = Date.now();
+  const actorId = request.headers.get("oai-authenticated-user-id") ?? "local-development";
+  const actorEmail = request.headers.get("oai-authenticated-user-email");
+  await env.DB.prepare(
+    `INSERT INTO workspace_audit_events
+      (id, occurred_at, actor_id, actor_email, action, case_id, detail)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, occurredAt, actorId, actorEmail, action, caseId, detail).run();
+  return json({ event: { id, occurredAt, actorId, actorEmail, action, caseId, detail } }, 201);
+}
+
+type ConversationAnalysis = {
+  sourceId: string;
+  inputMessageAt: number;
+  intent: string;
+  urgency: string;
+  risk: string;
+  confidence: number;
+  observation: string;
+  rationale: string;
+  draft: string;
+  evidence: string[];
+  model: string;
+  status: string;
+  updatedTimestamp: number;
+};
+
+async function handleConversationAnalysis(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, { Allow: "POST" });
+  if (!isSameOriginWrite(request)) return json({ error: "Invalid request origin" }, 403);
+  if (!env.DB) return json({ error: "Database is not configured" }, 503);
+  let body: { sourceId?: string };
+  try {
+    body = await request.json() as { sourceId?: string };
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+  const sourceId = body.sourceId?.trim() ?? "";
+  if (!/^[UCR][A-Za-z0-9_-]{10,}$/.test(sourceId)) return json({ error: "Invalid LINE source" }, 400);
+
+  const conversation = await env.DB.prepare(
+    `SELECT source_id AS sourceId, last_message_text AS lastMessageText,
+            last_message_direction AS lastMessageDirection,
+            last_message_at AS lastMessageAt, status
+     FROM line_conversations WHERE source_id = ?`,
+  ).bind(sourceId).first<{ sourceId: string; lastMessageText: string | null; lastMessageDirection: string; lastMessageAt: number; status: string }>();
+  if (!conversation) return json({ error: "Conversation not found" }, 404);
+
+  const existing = await readConversationAnalysis(env.DB, sourceId);
+  if (existing && existing.inputMessageAt >= Number(conversation.lastMessageAt)) {
+    return json({ analysis: existing, cached: true, configured: Boolean(env.OPENAI_API_KEY) });
+  }
+  if (!env.OPENAI_API_KEY) {
+    return json({ error: "OpenAI analysis is not configured", configured: false }, 503);
+  }
+
+  const mode = env.LINE_WORKSPACE_MODE === "clinic" ? "clinic" : "retail";
+  const [messagesResult, rulesResult] = await Promise.all([
+    env.DB.prepare(
+      `WITH conversation_messages AS (
+         SELECT 'customer' AS speaker, message_text AS text, event_timestamp AS timestamp,
+                webhook_event_id AS stable_id
+         FROM line_webhook_events
+         WHERE source_id = ? AND event_type = 'message' AND message_text IS NOT NULL
+         UNION ALL
+         SELECT 'staff' AS speaker, message_text AS text,
+                COALESCE(CAST(strftime('%s', sent_at) AS INTEGER) * 1000,
+                         CAST(strftime('%s', created_at) AS INTEGER) * 1000) AS timestamp,
+                request_id AS stable_id
+         FROM line_outbound_messages
+         WHERE target_id = ? AND status = 'sent'
+       )
+       SELECT speaker, text, timestamp FROM conversation_messages
+       ORDER BY timestamp DESC, stable_id DESC LIMIT 20`,
+    ).bind(sourceId, sourceId).all(),
+    env.DB.prepare(
+      `SELECT title, body FROM workspace_knowledge_rules
+       WHERE mode = ? AND active = 1
+       ORDER BY updated_at DESC, id ASC LIMIT 30`,
+    ).bind(mode).all(),
+  ]);
+
+  const messages = [...messagesResult.results].reverse();
+  const rules = rulesResult.results;
+  const model = env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
+  const actorId = request.headers.get("oai-authenticated-user-id") ?? "local-development";
+  const openAIResponse = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      store: false,
+      reasoning: { effort: "low" },
+      max_output_tokens: 1400,
+      safety_identifier: await stableSafetyIdentifier(actorId),
+      prompt_cache_key: `reply-ledger-${mode}-analysis-v1`,
+      instructions: analysisInstructions(mode),
+      input: JSON.stringify({ mode, conversation: messages, knowledge: rules }),
+      text: {
+        verbosity: "low",
+        format: {
+          type: "json_schema",
+          name: "reply_ledger_analysis",
+          strict: true,
+          schema: analysisSchema(),
+        },
+      },
+    }),
+  });
+  if (!openAIResponse.ok) {
+    const errorText = (await openAIResponse.text()).slice(0, 500);
+    return json({ error: "OpenAI analysis request failed", detail: errorText }, 502);
+  }
+  const responseBody = await openAIResponse.json() as Record<string, unknown>;
+  const outputText = extractOpenAIOutputText(responseBody);
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(outputText) as Record<string, unknown>;
+  } catch {
+    return json({ error: "OpenAI returned an unreadable analysis" }, 502);
+  }
+  const validated = validateAnalysis(parsed);
+  if (!validated) return json({ error: "OpenAI returned an invalid analysis" }, 502);
+
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO conversation_analyses
+        (source_id, input_message_at, intent, urgency, risk, confidence,
+         observation, rationale, draft, evidence_json, model, status, error_message, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', NULL, CURRENT_TIMESTAMP)
+       ON CONFLICT(source_id) DO UPDATE SET
+         input_message_at = excluded.input_message_at,
+         intent = excluded.intent,
+         urgency = excluded.urgency,
+         risk = excluded.risk,
+         confidence = excluded.confidence,
+         observation = excluded.observation,
+         rationale = excluded.rationale,
+         draft = excluded.draft,
+         evidence_json = excluded.evidence_json,
+         model = excluded.model,
+         status = excluded.status,
+         error_message = NULL,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE excluded.input_message_at >= conversation_analyses.input_message_at`,
+    ).bind(
+      sourceId, Number(conversation.lastMessageAt), validated.intent, validated.urgency,
+      validated.risk, validated.confidence, validated.observation, validated.rationale,
+      validated.draft, JSON.stringify(validated.evidence), model,
+    ),
+    env.DB.prepare(
+      `INSERT INTO workspace_audit_events
+        (id, occurred_at, actor_id, actor_email, action, case_id, detail)
+       VALUES (?, ?, ?, ?, 'AI 產生建議', ?, ?)`,
+    ).bind(
+      crypto.randomUUID(), now, actorId, request.headers.get("oai-authenticated-user-email"),
+      `LIVE-${sourceId}`, `模型 ${model}；引用 ${validated.evidence.length} 份根據。`,
+    ),
+  ]);
+  const analysis: ConversationAnalysis = {
+    sourceId,
+    inputMessageAt: Number(conversation.lastMessageAt),
+    ...validated,
+    model,
+    status: "ready",
+    updatedTimestamp: now,
+  };
+  return json({ analysis, cached: false, configured: true });
+}
+
+async function readConversationAnalysis(db: D1Database, sourceId: string): Promise<ConversationAnalysis | null> {
+  const row = await db.prepare(
+    `SELECT source_id AS sourceId, input_message_at AS inputMessageAt,
+            intent, urgency, risk, confidence, observation, rationale, draft,
+            evidence_json AS evidenceJson, model, status,
+            CAST(strftime('%s', updated_at) AS INTEGER) * 1000 AS updatedTimestamp
+     FROM conversation_analyses WHERE source_id = ?`,
+  ).bind(sourceId).first<Record<string, unknown>>();
+  if (!row) return null;
+  let evidence: string[] = [];
+  try {
+    const parsed = JSON.parse(String(row.evidenceJson ?? "[]"));
+    if (Array.isArray(parsed)) evidence = parsed.filter((item): item is string => typeof item === "string").slice(0, 8);
+  } catch {
+    evidence = [];
+  }
+  return {
+    sourceId: String(row.sourceId),
+    inputMessageAt: Number(row.inputMessageAt),
+    intent: String(row.intent),
+    urgency: String(row.urgency),
+    risk: String(row.risk),
+    confidence: Number(row.confidence),
+    observation: String(row.observation),
+    rationale: String(row.rationale),
+    draft: String(row.draft),
+    evidence,
+    model: String(row.model),
+    status: String(row.status),
+    updatedTimestamp: Number(row.updatedTimestamp),
+  };
+}
+
+function analysisInstructions(mode: "retail" | "clinic") {
+  const domainPolicy = mode === "clinic"
+    ? "Do not diagnose, calculate dosage, or reassure away urgent symptoms. Escalate medical risk to a qualified human."
+    : "Do not invent price, stock, dimensions, compatibility, or installation cost. Ask for missing site details or photos before promising installation totals.";
+  return `You are Reply Ledger, a Traditional Chinese customer-service observer. Analyze the supplied LINE conversation and knowledge rules. ${domainPolicy} Use only facts present in the conversation or knowledge list. Evidence entries must exactly match supplied knowledge titles; use an empty list when no rule applies. Draft a concise Traditional Chinese reply that is ready for human review but never claims it was sent. Describe uncertainty explicitly. Return only the structured output.`;
+}
+
+function analysisSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["intent", "urgency", "risk", "confidence", "observation", "rationale", "draft", "evidence"],
+    properties: {
+      intent: { type: "string", minLength: 1, maxLength: 60 },
+      urgency: { type: "string", enum: ["低", "中", "高"] },
+      risk: { type: "string", minLength: 1, maxLength: 120 },
+      confidence: { type: "integer", minimum: 0, maximum: 100 },
+      observation: { type: "string", minLength: 1, maxLength: 500 },
+      rationale: { type: "string", minLength: 1, maxLength: 700 },
+      draft: { type: "string", minLength: 1, maxLength: 1800 },
+      evidence: { type: "array", maxItems: 8, items: { type: "string", maxLength: 120 } },
+    },
+  };
+}
+
+function validateAnalysis(value: Record<string, unknown>) {
+  const fields = ["intent", "urgency", "risk", "observation", "rationale", "draft"] as const;
+  if (fields.some((field) => typeof value[field] !== "string" || !(value[field] as string).trim())) return null;
+  const confidence = Number(value.confidence);
+  if (!Number.isInteger(confidence) || confidence < 0 || confidence > 100) return null;
+  if (!Array.isArray(value.evidence) || value.evidence.some((item) => typeof item !== "string")) return null;
+  return {
+    intent: String(value.intent).slice(0, 60),
+    urgency: new Set(["低", "中", "高"]).has(String(value.urgency)) ? String(value.urgency) : "中",
+    risk: String(value.risk).slice(0, 120),
+    confidence,
+    observation: String(value.observation).slice(0, 500),
+    rationale: String(value.rationale).slice(0, 700),
+    draft: String(value.draft).slice(0, 1800),
+    evidence: (value.evidence as string[]).map((item) => item.slice(0, 120)).slice(0, 8),
+  };
+}
+
+function extractOpenAIOutputText(body: Record<string, unknown>) {
+  if (typeof body.output_text === "string") return body.output_text;
+  const output = Array.isArray(body.output) ? body.output : [];
+  for (const item of output) {
+    if (!item || typeof item !== "object") continue;
+    const content = Array.isArray((item as { content?: unknown }).content) ? (item as { content: unknown[] }).content : [];
+    for (const part of content) {
+      if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+        return (part as { text: string }).text;
+      }
+    }
+  }
+  return "";
+}
+
+async function stableSafetyIdentifier(actorId: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(actorId));
+  return Array.from(new Uint8Array(digest)).slice(0, 16).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function handleLineSend(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, { Allow: "POST" });
+  if (!isSameOriginWrite(request)) return json({ error: "Invalid request origin" }, 403);
   if (!env.DB || !env.LINE_CHANNEL_ACCESS_TOKEN) return json({ error: "LINE sending is not configured" }, 503);
 
   let body: { to?: string; text?: string; requestId?: string };
@@ -611,6 +988,16 @@ function timingSafeEqual(left: string, right: string) {
 function isDashboardRequest(request: Request) {
   const host = new URL(request.url).hostname;
   return host === "localhost" || host === "127.0.0.1" || Boolean(request.headers.get("oai-authenticated-user-id"));
+}
+
+function isSameOriginWrite(request: Request) {
+  const origin = request.headers.get("origin");
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === new URL(request.url).origin;
+  } catch {
+    return false;
+  }
 }
 
 function json(value: unknown, status = 200, headers?: Record<string, string>) {

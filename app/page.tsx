@@ -1,12 +1,14 @@
-import ReplyLedger from "./ReplyLedger";
-import { headers } from "next/headers";
-import { requireChatGPTUser } from "./chatgpt-auth";
+import LandingPage from "./LandingPage";
+import { chatGPTSignInPath, getChatGPTUser } from "./chatgpt-auth";
+
+export const dynamic = "force-dynamic";
 
 export default async function Home() {
-  const requestHeaders = await headers();
-  const host = requestHeaders.get("host") ?? "";
-  if (!host.startsWith("localhost:") && !host.startsWith("127.0.0.1:")) {
-    await requireChatGPTUser("/");
-  }
-  return <ReplyLedger />;
+  const user = await getChatGPTUser();
+  return (
+    <LandingPage
+      workspaceHref={user ? "/app" : chatGPTSignInPath("/app")}
+      signedIn={Boolean(user)}
+    />
+  );
 }

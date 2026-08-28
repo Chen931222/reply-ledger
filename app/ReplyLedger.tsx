@@ -3,12 +3,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { casesByMode, knowledgeByMode, modeInfo, seededAudit, type LedgerCase, type Mode, type View } from "./data";
 
-type AuditRecord = (typeof seededAudit)[number];
-type LearnedRule = { id: string; mode: Mode; title: string; body: string; createdAt: string };
+type AuditRecord = { id: string; time: string; actor: string; action: string; caseId: string; detail: string };
+type LearnedRule = { id: string; mode: Mode; title: string; body: string; createdTimestamp: number; updatedTimestamp: number };
+type ConversationAnalysis = {
+  sourceId: string;
+  inputMessageAt: number;
+  intent: string;
+  urgency: string;
+  risk: string;
+  confidence: number;
+  observation: string;
+  rationale: string;
+  draft: string;
+  evidence: string[];
+  model: string;
+  status: string;
+  updatedTimestamp: number;
+};
 type LineStatus = {
   databaseReady: boolean;
   receiveReady: boolean;
   sendReady: boolean;
+  aiReady: boolean;
   workspaceMode: string;
   eventCount: number;
   lastEventAt: number | null;
@@ -59,8 +75,7 @@ type WorkbenchCase = LedgerCase & {
   pendingReply?: boolean;
 };
 type SendState = "idle" | "confirming" | "sending" | "sent" | "error";
-
-const storageKey = "reply-ledger-v1";
+type AnalysisState = "idle" | "loading" | "ready" | "unavailable" | "error";
 
 function formatMessageTime(timestamp: number) {
   return new Intl.DateTimeFormat("zh-TW", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(timestamp));
@@ -116,6 +131,31 @@ async function fetchLineInbox() {
   return response.json() as Promise<{ events: LineInboxEvent[] }>;
 }
 
+async function fetchWorkspaceState() {
+  const [retailResponse, clinicResponse, auditResponse] = await Promise.all([
+    fetch("/api/workspace/knowledge?mode=retail", { headers: { accept: "application/json" } }),
+    fetch("/api/workspace/knowledge?mode=clinic", { headers: { accept: "application/json" } }),
+    fetch("/api/workspace/audit?limit=200", { headers: { accept: "application/json" } }),
+  ]);
+  if (!retailResponse.ok || !clinicResponse.ok || !auditResponse.ok) throw new Error("工作區資料暫時無法同步。");
+  const retail = await retailResponse.json() as { rules: LearnedRule[] };
+  const clinic = await clinicResponse.json() as { rules: LearnedRule[] };
+  const auditResult = await auditResponse.json() as {
+    events: Array<{ id: string; occurredAt: number; actorId: string; actorEmail: string | null; action: string; caseId: string; detail: string }>;
+  };
+  return {
+    rules: [...retail.rules, ...clinic.rules],
+    audit: auditResult.events.map((event): AuditRecord => ({
+      id: event.id,
+      time: formatMessageTime(event.occurredAt),
+      actor: event.actorEmail ?? event.actorId,
+      action: event.action,
+      caseId: event.caseId,
+      detail: event.detail,
+    })),
+  };
+}
+
 export default function ReplyLedger() {
   const [mode, setMode] = useState<Mode>("retail");
   const [view, setView] = useState<View>("workspace");
@@ -125,9 +165,9 @@ export default function ReplyLedger() {
   const [draft, setDraft] = useState(casesByMode.retail[0].draft);
   const [audit, setAudit] = useState<AuditRecord[]>(seededAudit);
   const [learned, setLearned] = useState<LearnedRule[]>([]);
-  const [hydrated, setHydrated] = useState(false);
   const [toast, setToast] = useState("");
   const [newRuleOpen, setNewRuleOpen] = useState(false);
+  const [newRuleTitle, setNewRuleTitle] = useState("");
   const [newRule, setNewRule] = useState("");
   const [lineStatus, setLineStatus] = useState<LineStatus | null>(null);
   const [lineInbox, setLineInbox] = useState<LineInboxEvent[]>([]);
@@ -136,6 +176,8 @@ export default function ReplyLedger() {
   const [conversationCursor, setConversationCursor] = useState<string | null>(null);
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, LineConversationMessage[]>>({});
   const [messageCursorByConversation, setMessageCursorByConversation] = useState<Record<string, string | null>>({});
+  const [analysisByConversation, setAnalysisByConversation] = useState<Record<string, ConversationAnalysis>>({});
+  const [analysisStateByConversation, setAnalysisStateByConversation] = useState<Record<string, AnalysisState>>({});
   const [lineLoading, setLineLoading] = useState(true);
   const [lineError, setLineError] = useState("");
   const [sendState, setSendState] = useState<SendState>("idle");
@@ -147,6 +189,7 @@ export default function ReplyLedger() {
 
   const liveCases = useMemo<WorkbenchCase[]>(() => {
     return lineConversations.map((conversation) => {
+      const analysis = analysisByConversation[conversation.sourceId];
       const storedMessages = messagesByConversation[conversation.sourceId] ?? [];
       const timeline = (storedMessages.length > 0 ? storedMessages : [{
         direction: conversation.lastMessageDirection,
@@ -166,30 +209,32 @@ export default function ReplyLedger() {
         id: `LIVE-${conversation.sourceId}`,
         kind: "live",
         sourceId: conversation.sourceId,
-        revision: `${conversation.lastMessageAt}:${conversation.lastMessageDirection}`,
+        revision: `${conversation.lastMessageAt}:${conversation.lastMessageDirection}:${analysis?.updatedTimestamp ?? 0}`,
         latestActivityTimestamp: conversation.lastMessageAt,
         pendingReply,
         customer: `LINE 使用者 ${maskLineId(conversation.sourceId)}`,
         title: "LINE 即時訊息",
         waiting: formatWaitingTime(conversation.lastMessageAt),
         tag: pendingReply ? "真實 LINE" : "已回覆",
-        intent: "待人工判讀",
-        urgency: "待確認",
-        risk: "尚未分類",
-        confidence: 0,
-        observation: "這是已通過 LINE 簽章驗證並寫入資料庫的真實訊息，目前尚未進行內容判讀。",
-        why: "工作台只確認訊息來源與完整性；在資訊不足時，不會把單一句話猜成商品、報價或售後需求。",
-        draft: `您好，已收到您的訊息「${conversation.lastMessageText ?? ""}」。請問您想詢問燈具選購、報價、安裝，還是售後服務呢？`,
+        intent: analysis?.intent ?? "待人工判讀",
+        urgency: analysis?.urgency ?? "待確認",
+        risk: analysis?.risk ?? "尚未分類",
+        confidence: analysis?.confidence ?? 0,
+        observation: analysis?.observation ?? "這是已通過 LINE 簽章驗證並寫入資料庫的真實訊息，目前尚未進行內容判讀。",
+        why: analysis?.rationale ?? "工作台只確認訊息來源與完整性；在資訊不足時，不會把單一句話猜成商品、報價或售後需求。",
+        draft: analysis?.draft ?? `您好，已收到您的訊息「${conversation.lastMessageText ?? ""}」。請問您想詢問燈具選購、報價、安裝，還是售後服務呢？`,
         messages: timeline.map(({ side, time, text }) => ({ side, time, text })),
-        sources: [{
-          label: "LINE 已驗證對話",
-          excerpt: `${formatLineTime(conversation.lastMessageAt)} 更新；來源 ${maskLineId(conversation.sourceId)}。`,
-        }],
+        sources: analysis?.evidence.length
+          ? analysis.evidence.map((item) => ({ label: "AI 引用根據", excerpt: item }))
+          : [{
+              label: "LINE 已驗證對話",
+              excerpt: `${formatLineTime(conversation.lastMessageAt)} 更新；來源 ${maskLineId(conversation.sourceId)}。`,
+            }],
       };
     }).sort((left, right) => {
       return (right.latestActivityTimestamp ?? 0) - (left.latestActivityTimestamp ?? 0);
     });
-  }, [lineConversations, messagesByConversation]);
+  }, [analysisByConversation, lineConversations, messagesByConversation]);
 
   const demoCases = useMemo<WorkbenchCase[]>(() => casesByMode[mode].map((item) => ({ ...item, kind: "demo" })), [mode]);
   const cases = mode === "retail" && liveCases.length > 0 ? liveCases : demoCases;
@@ -198,19 +243,15 @@ export default function ReplyLedger() {
   const pendingCount = cases.filter((item) => item.kind === "live" && item.pendingReply).length;
 
   useEffect(() => {
-    window.queueMicrotask(() => {
-      try {
-        const saved = window.localStorage.getItem(storageKey);
-        if (saved) {
-          const parsed = JSON.parse(saved) as { audit?: AuditRecord[]; learned?: LearnedRule[] };
-          if (parsed.audit) setAudit(parsed.audit);
-          if (parsed.learned) setLearned(parsed.learned);
-        }
-      } catch {
-        // The ledger still works when browser storage is unavailable or malformed.
-      }
-      setHydrated(true);
+    let active = true;
+    void fetchWorkspaceState().then((result) => {
+      if (!active) return;
+      setLearned(result.rules);
+      setAudit(result.audit);
+    }).catch(() => {
+      if (active) setLineError("工作區知識與稽核紀錄暫時無法同步；目前顯示安全的示範內容。");
     });
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -270,6 +311,35 @@ export default function ReplyLedger() {
     return () => { active = false; window.clearInterval(refreshTimer); };
   }, [selected.kind, selected.sourceId, selected.revision]);
 
+  useEffect(() => {
+    if (paused || selected.kind !== "live" || !selected.sourceId) return;
+    const sourceId = selected.sourceId;
+    if (!lineStatus?.aiReady) return;
+    const currentAnalysis = analysisByConversation[sourceId];
+    if (currentAnalysis && currentAnalysis.inputMessageAt >= (selected.latestActivityTimestamp ?? 0)) return;
+    let active = true;
+    window.queueMicrotask(() => {
+      if (active) setAnalysisStateByConversation((current) => ({ ...current, [sourceId]: "loading" }));
+    });
+    void fetch("/api/ai/analyze", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ sourceId }),
+    }).then(async (response) => {
+      const result = await response.json().catch(() => null) as { analysis?: ConversationAnalysis; configured?: boolean; error?: string } | null;
+      if (!active) return;
+      if (!response.ok || !result?.analysis) {
+        setAnalysisStateByConversation((current) => ({ ...current, [sourceId]: result?.configured === false ? "unavailable" : "error" }));
+        return;
+      }
+      setAnalysisByConversation((current) => ({ ...current, [sourceId]: result.analysis! }));
+      setAnalysisStateByConversation((current) => ({ ...current, [sourceId]: "ready" }));
+    }).catch(() => {
+      if (active) setAnalysisStateByConversation((current) => ({ ...current, [sourceId]: "error" }));
+    });
+    return () => { active = false; };
+  }, [analysisByConversation, lineStatus?.aiReady, paused, selected.kind, selected.latestActivityTimestamp, selected.sourceId]);
+
   async function loadMoreConversations() {
     if (!conversationCursor) return;
     try {
@@ -320,11 +390,6 @@ export default function ReplyLedger() {
     sendRequestId.current = null;
   }, [selected.draft, selected.id, selected.revision]);
 
-  useEffect(() => {
-    if (!hydrated) return;
-    window.localStorage.setItem(storageKey, JSON.stringify({ audit, learned }));
-  }, [audit, hydrated, learned]);
-
   function changeMode(nextMode: Mode) {
     setMode(nextMode);
     const nextCases = nextMode === "retail" && liveCases.length > 0
@@ -356,6 +421,20 @@ export default function ReplyLedger() {
       detail,
     };
     setAudit((current) => [record, ...current]);
+    void fetch("/api/workspace/audit", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ action, caseId: selected.id, detail }),
+    }).then(async (response) => {
+      if (!response.ok) throw new Error("audit write failed");
+      const result = await response.json() as { event: { id: string; occurredAt: number; actorId: string; actorEmail: string | null } };
+      setAudit((current) => current.map((item) => item.id === record.id ? {
+        ...item,
+        id: result.event.id,
+        time: formatMessageTime(result.event.occurredAt),
+        actor: result.event.actorEmail ?? result.event.actorId,
+      } : item));
+    }).catch(() => flash("動作已完成，但稽核紀錄暫時無法同步。"));
   }
 
   function prepareLineSend() {
@@ -401,15 +480,7 @@ export default function ReplyLedger() {
       }
 
       const wasEdited = currentDraft.trim() !== selected.draft.trim();
-      if (wasEdited) {
-        setLearned((items) => [{
-          id: `L-${Date.now()}`,
-          mode,
-          title: `${selected.title} · 人工修正版`,
-          body: currentDraft.trim(),
-          createdAt: "剛剛",
-        }, ...items]);
-      }
+      logAction("確認並傳送", wasEdited ? "真人修改 AI 草稿後確認傳送。" : "真人覆核 AI 草稿後確認傳送。");
       setSendState("sent");
       setSendRetryable(false);
       await refreshLineData();
@@ -435,12 +506,27 @@ export default function ReplyLedger() {
     flash(mode === "clinic" ? "已通知值班人員並保留完整理由。" : "已交給真人客服，AI 暫停這則對話的建議。 ");
   }
 
-  function addRule() {
-    if (!newRule.trim()) return;
-    setLearned((items) => [{ id: `L-${Date.now()}`, mode, title: "人工新增規則", body: newRule.trim(), createdAt: "剛剛" }, ...items]);
-    setNewRule("");
-    setNewRuleOpen(false);
-    flash("新規則已存入這個裝置的知識帳簿。");
+  async function addRule() {
+    if (!newRuleTitle.trim() || !newRule.trim()) {
+      flash("請填寫規則名稱與內容。");
+      return;
+    }
+    try {
+      const response = await fetch("/api/workspace/knowledge", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ mode, title: newRuleTitle.trim(), body: newRule.trim() }),
+      });
+      const result = await response.json().catch(() => null) as { rule?: LearnedRule; error?: string } | null;
+      if (!response.ok || !result?.rule) throw new Error(result?.error ?? "規則無法儲存。");
+      setLearned((items) => [result.rule!, ...items]);
+      setNewRuleTitle("");
+      setNewRule("");
+      setNewRuleOpen(false);
+      flash("新規則已存入工作區知識帳簿，可跨裝置使用。");
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "規則無法儲存。");
+    }
   }
 
   const modeLearned = useMemo(() => learned.filter((item) => item.mode === mode), [learned, mode]);
@@ -471,6 +557,24 @@ export default function ReplyLedger() {
   }, [audit, lineOutbox]);
   const lineState = lineStatus?.receiveReady ? (lineStatus.eventCount > 0 ? "live" : "ready") : "demo";
   const lineStateLabel = lineState === "live" ? "LINE 已連線" : lineState === "ready" ? "LINE 待測試" : modeInfo[mode].status;
+  const selectedAnalysisState = selected.kind === "live" && selected.sourceId
+    ? !lineStatus?.aiReady
+      ? "unavailable"
+      : analysisByConversation[selected.sourceId]
+        ? "ready"
+        : analysisStateByConversation[selected.sourceId] ?? "idle"
+    : "ready";
+  const confidenceLabel = selected.kind !== "live"
+    ? `${selected.confidence}%`
+    : selectedAnalysisState === "ready"
+      ? `${selected.confidence}%`
+      : selectedAnalysisState === "loading"
+        ? "判讀中"
+        : selectedAnalysisState === "unavailable"
+          ? "AI 未啟用"
+          : selectedAnalysisState === "error"
+            ? "判讀失敗"
+            : "需覆核";
 
   function maskLineId(value: string | null) {
     if (!value) return "未知來源";
@@ -569,8 +673,10 @@ export default function ReplyLedger() {
           </section>
 
           <aside className={`advice-panel ${paused ? "is-paused" : ""}`}>
-            <div className="section-label"><span>02</span><p>AI 建議</p><strong className="confidence">{selected.kind === "live" ? "需覆核" : `${selected.confidence}%`}</strong></div>
+            <div className="section-label"><span>02</span><p>AI 建議</p><strong className="confidence">{confidenceLabel}</strong></div>
             {paused && <div className="pause-notice"><strong>AI 觀察已暫停</strong><p>既有分析仍保留，但不會產生新建議。</p></div>}
+            {selected.kind === "live" && selectedAnalysisState === "unavailable" && <div className="pause-notice ai-unavailable"><strong>OpenAI 分析尚未設定</strong><p>目前只顯示安全保守草稿；訊息仍會正常保存，且不會自動送出。</p></div>}
+            {selected.kind === "live" && selectedAnalysisState === "error" && <div className="pause-notice ai-unavailable"><strong>本次判讀失敗</strong><p>工作台保留原始訊息與安全草稿，請由真人判讀後再回覆。</p></div>}
             <div className={`attention-panel ${selected.pendingReply === false ? "resolved" : ""}`}>
               <span>{selected.pendingReply === false ? "DONE" : "NEXT ACTION"}</span>
               <strong>{selected.pendingReply === false ? "最新訊息已經回覆" : selected.kind === "live" ? "確認客戶需求，再送出回覆" : selected.requiresHuman ? "先確認風險，再決定是否回覆" : "檢查草稿後即可採用"}</strong>
@@ -633,6 +739,7 @@ export default function ReplyLedger() {
             <article><span>01</span><p>資料庫</p><strong>{lineStatus?.databaseReady ? "持久化已就緒" : "尚未建立"}</strong></article>
             <article><span>02</span><p>接收</p><strong>{lineStatus?.receiveReady ? "簽章驗證已備妥" : "等待 Channel secret"}</strong></article>
             <article><span>03</span><p>傳送</p><strong>{lineStatus?.sendReady ? "人工確認後可送出" : "等待 Access token"}</strong></article>
+            <article><span>04</span><p>AI 判讀</p><strong>{lineStatus?.aiReady ? "Responses API 已備妥" : "等待 OpenAI API key"}</strong></article>
           </div>
           <div className="live-inbox-head"><p>已驗證事件</p><span>{lineInbox.length} / 最近 50 筆</span></div>
           {lineLoading ? <div className="empty-state">正在讀取連線狀態。</div> : lineInbox.length === 0 ? (
@@ -665,11 +772,11 @@ export default function ReplyLedger() {
       {view === "knowledge" && (
         <section className="page-sheet knowledge-view">
           <div className="page-title"><div><p className="eyebrow">KNOWLEDGE LEDGER · {modeInfo[mode].name}</p><h2>回答以前，先知道根據在哪。</h2></div><button className="ink-button" onClick={() => setNewRuleOpen(!newRuleOpen)}>＋ 新增規則</button></div>
-          {newRuleOpen && <div className="rule-composer"><label htmlFor="new-rule">寫下一條 AI 必須遵守的規則</label><textarea id="new-rule" value={newRule} onChange={(event) => setNewRule(event.target.value)} placeholder={mode === "clinic" ? "例如：遇到兒童用藥問題，一律不推算劑量並轉交護理人員。" : "例如：沒有看到現場照片前，不得承諾安裝總價。"}/><div><button onClick={() => setNewRuleOpen(false)}>取消</button><button className="primary-action" onClick={addRule}>存入帳簿</button></div></div>}
+          {newRuleOpen && <div className="rule-composer"><label htmlFor="new-rule-title">規則名稱</label><input id="new-rule-title" value={newRuleTitle} onChange={(event) => setNewRuleTitle(event.target.value)} placeholder={mode === "clinic" ? "例如：兒童用藥轉交規則" : "例如：安裝報價前置條件"}/><label htmlFor="new-rule">寫下一條 AI 必須遵守的規則</label><textarea id="new-rule" value={newRule} onChange={(event) => setNewRule(event.target.value)} placeholder={mode === "clinic" ? "例如：遇到兒童用藥問題，一律不推算劑量並轉交護理人員。" : "例如：沒有看到現場照片前，不得承諾安裝總價。"}/><div><button onClick={() => setNewRuleOpen(false)}>取消</button><button className="primary-action" onClick={() => void addRule()}>存入帳簿</button></div></div>}
           <div className="knowledge-grid">
-            {knowledgeByMode[mode].map((item, index) => <article key={item.title}><span>0{index + 1}</span><p>{item.type}</p><h3>{item.title}</h3><strong>{item.scope}</strong><footer>最後更新 · {item.updated}</footer></article>)}
+            {(modeLearned.length > 0 ? modeLearned : knowledgeByMode[mode].map((item, index) => ({ id: `fallback-${index}`, mode, title: item.title, body: item.scope, createdTimestamp: 0, updatedTimestamp: 0 }))).map((item, index) => <article key={item.id}><span>0{index + 1}</span><p>{item.id.startsWith("fallback-") ? "內建示範" : "工作區規則"}</p><h3>{item.title}</h3><strong>{item.body}</strong><footer>{item.updatedTimestamp ? `最後更新 · ${new Intl.DateTimeFormat("zh-TW", { month: "2-digit", day: "2-digit" }).format(new Date(item.updatedTimestamp))}` : "等待資料庫同步"}</footer></article>)}
           </div>
-          <div className="learned-section"><div className="section-heading"><p>人工修正案例</p><span>{modeLearned.length} 則自這個裝置累積</span></div>{modeLearned.length === 0 ? <div className="empty-state">採用修改過的回覆後，它會以案例形式出現在這裡；AI 不會因單次修改自動改寫全部規則。</div> : modeLearned.map((item) => <article className="learned-row" key={item.id}><span>{item.createdAt}</span><div><h3>{item.title}</h3><p>{item.body}</p></div></article>)}</div>
+          <div className="learned-section"><div className="section-heading"><p>儲存原則</p><span>{modeLearned.length} 則工作區共用規則</span></div><div className="empty-state">規則會寫入工作區資料庫，可跨裝置讀取；單次修改回覆只寫入稽核紀錄，不會偷偷改寫全域規則。</div></div>
         </section>
       )}
 

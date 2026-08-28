@@ -5,6 +5,9 @@ workflows. The product keeps demo cases visibly separate from verified live
 LINE events, records incoming events in D1, and never sends from the AI draft
 surface automatically.
 
+The public product page lives at `/`. The authenticated operational workspace
+lives at `/app`; live LINE records are never rendered on the public route.
+
 ## Prerequisites
 
 - Node.js `>=22.13.0`
@@ -27,6 +30,15 @@ This starter does not use `wrangler.jsonc`.
 - Stores only the event fields needed by the inbox; raw webhook JSON and reply tokens are not retained.
 - `/api/line/send` is authenticated, idempotent, and unavailable until a channel access token is configured.
 
+## Grounded AI analysis
+
+- `/api/ai/analyze` uses the OpenAI Responses API with strict structured output.
+- Conversation context and active knowledge rules are read server-side from D1.
+- The response is stored in `conversation_analyses`; knowledge rules and operator decisions are stored in durable workspace tables.
+- `store: false` is sent to OpenAI. The API key stays server-side.
+- AI only produces a review draft. It never calls the LINE send endpoint, and LINE still requires the explicit second confirmation in the workspace.
+- When `OPENAI_API_KEY` is absent or analysis fails, the UI says so and falls back to a conservative human-review draft.
+
 ### Message storage model
 
 - `line_webhook_events` is the durable inbound event ledger. LINE text cannot be fetched again later, so verified events are written before the webhook returns success.
@@ -41,6 +53,8 @@ Sites environment variables and must be marked secret:
 - `LINE_CHANNEL_SECRET`
 - `LINE_CHANNEL_ACCESS_TOKEN`
 - `LINE_WORKSPACE_MODE` (`retail` or `clinic`)
+- `OPENAI_API_KEY` (secret)
+- `OPENAI_MODEL` (defaults to `gpt-5.4-mini`)
 
 The dashboard requires Sign in with ChatGPT outside local development. For LINE
 to reach the webhook, production must expose the Site publicly while retaining
