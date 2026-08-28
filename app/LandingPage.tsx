@@ -7,10 +7,12 @@ export default function LandingPage({ workspaceHref, signedIn }: LandingPageProp
   return (
     <main className="landing-shell">
       <nav className="landing-nav" aria-label="公開網站導覽">
-        <Link className="landing-brand" href="/" aria-label="Reply Ledger 首頁">
+        {/* A document link keeps this public server component independent of client-router hydration. */}
+        {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
+        <a className="landing-brand" href="/" aria-label="Reply Ledger 首頁">
           <span>R/L</span>
           <strong>REPLY LEDGER · 回覆帳簿</strong>
-        </Link>
+        </a>
         <div>
           <a href="/intro.html">60 秒導覽</a>
           <a className="landing-enter" href={workspaceHref} target="_top">
@@ -58,4 +60,3 @@ export default function LandingPage({ workspaceHref, signedIn }: LandingPageProp
     </main>
   );
 }
-import Link from "next/link";
