@@ -1,6 +1,7 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { analyzeWithRules, type AnalysisKnowledgeRule, type AnalysisMessage, type RuleAnalysis } from "./rule-engine";
 
 interface Env {
   ASSETS: Fetcher;
@@ -179,6 +180,8 @@ async function handleLineStatus(request: Request, env: Env): Promise<Response> {
     receiveReady: databaseReady && Boolean(env.LINE_CHANNEL_SECRET),
     sendReady: databaseReady && Boolean(env.LINE_CHANNEL_ACCESS_TOKEN),
     aiReady: databaseReady && Boolean(env.OPENAI_API_KEY),
+    analysisReady: databaseReady,
+    analysisMode: env.OPENAI_API_KEY ? "openai" : "rules",
     workspaceMode: env.LINE_WORKSPACE_MODE === "clinic" ? "clinic" : "retail",
     eventCount,
     lastEventAt,
@@ -479,6 +482,7 @@ type ConversationAnalysis = {
   rationale: string;
   draft: string;
   evidence: string[];
+  engine: "openai" | "rules";
   model: string;
   status: string;
   updatedTimestamp: number;
@@ -506,11 +510,9 @@ async function handleConversationAnalysis(request: Request, env: Env): Promise<R
   if (!conversation) return json({ error: "Conversation not found" }, 404);
 
   const existing = await readConversationAnalysis(env.DB, sourceId);
-  if (existing && existing.inputMessageAt >= Number(conversation.lastMessageAt)) {
-    return json({ analysis: existing, cached: true, configured: Boolean(env.OPENAI_API_KEY) });
-  }
-  if (!env.OPENAI_API_KEY) {
-    return json({ error: "OpenAI analysis is not configured", configured: false }, 503);
+  const openAIConfigured = Boolean(env.OPENAI_API_KEY);
+  if (existing && existing.inputMessageAt >= Number(conversation.lastMessageAt) && (!openAIConfigured || existing.engine === "openai")) {
+    return json({ analysis: existing, cached: true, configured: openAIConfigured, engine: existing.engine });
   }
 
   const mode = env.LINE_WORKSPACE_MODE === "clinic" ? "clinic" : "retail";
@@ -539,50 +541,56 @@ async function handleConversationAnalysis(request: Request, env: Env): Promise<R
     ).bind(mode).all(),
   ]);
 
-  const messages = [...messagesResult.results].reverse();
-  const rules = rulesResult.results;
-  const model = env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
+  const messages = [...messagesResult.results].reverse() as AnalysisMessage[];
+  const rules = rulesResult.results as AnalysisKnowledgeRule[];
+  let model = "rules-v1";
+  let engine: ConversationAnalysis["engine"] = "rules";
+  let validated: RuleAnalysis = analyzeWithRules(mode, messages, rules);
   const actorId = request.headers.get("oai-authenticated-user-id") ?? "local-development";
-  const openAIResponse = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${env.OPENAI_API_KEY}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      store: false,
-      reasoning: { effort: "low" },
-      max_output_tokens: 1400,
-      safety_identifier: await stableSafetyIdentifier(actorId),
-      prompt_cache_key: `reply-ledger-${mode}-analysis-v1`,
-      instructions: analysisInstructions(mode),
-      input: JSON.stringify({ mode, conversation: messages, knowledge: rules }),
-      text: {
-        verbosity: "low",
-        format: {
-          type: "json_schema",
-          name: "reply_ledger_analysis",
-          strict: true,
-          schema: analysisSchema(),
+  if (env.OPENAI_API_KEY) {
+    try {
+      const requestedModel = env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
+      const openAIResponse = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          "content-type": "application/json",
         },
-      },
-    }),
-  });
-  if (!openAIResponse.ok) {
-    const errorText = (await openAIResponse.text()).slice(0, 500);
-    return json({ error: "OpenAI analysis request failed", detail: errorText }, 502);
+        body: JSON.stringify({
+          model: requestedModel,
+          store: false,
+          reasoning: { effort: "low" },
+          max_output_tokens: 1400,
+          safety_identifier: await stableSafetyIdentifier(actorId),
+          prompt_cache_key: `reply-ledger-${mode}-analysis-v1`,
+          instructions: analysisInstructions(mode),
+          input: JSON.stringify({ mode, conversation: messages, knowledge: rules }),
+          text: {
+            verbosity: "low",
+            format: {
+              type: "json_schema",
+              name: "reply_ledger_analysis",
+              strict: true,
+              schema: analysisSchema(),
+            },
+          },
+        }),
+      });
+      if (openAIResponse.ok) {
+        const responseBody = await openAIResponse.json() as Record<string, unknown>;
+        const outputText = extractOpenAIOutputText(responseBody);
+        const parsed = JSON.parse(outputText) as Record<string, unknown>;
+        const openAIAnalysis = validateAnalysis(parsed);
+        if (openAIAnalysis) {
+          validated = openAIAnalysis;
+          model = requestedModel;
+          engine = "openai";
+        }
+      }
+    } catch {
+      // The deterministic engine remains available when the optional provider is unavailable.
+    }
   }
-  const responseBody = await openAIResponse.json() as Record<string, unknown>;
-  const outputText = extractOpenAIOutputText(responseBody);
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(outputText) as Record<string, unknown>;
-  } catch {
-    return json({ error: "OpenAI returned an unreadable analysis" }, 502);
-  }
-  const validated = validateAnalysis(parsed);
-  if (!validated) return json({ error: "OpenAI returned an invalid analysis" }, 502);
 
   const now = Date.now();
   await env.DB.batch([
@@ -614,21 +622,23 @@ async function handleConversationAnalysis(request: Request, env: Env): Promise<R
     env.DB.prepare(
       `INSERT INTO workspace_audit_events
         (id, occurred_at, actor_id, actor_email, action, case_id, detail)
-       VALUES (?, ?, ?, ?, 'AI 產生建議', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       crypto.randomUUID(), now, actorId, request.headers.get("oai-authenticated-user-email"),
-      `LIVE-${sourceId}`, `模型 ${model}；引用 ${validated.evidence.length} 份根據。`,
+      engine === "openai" ? "AI 產生建議" : "規則引擎產生建議",
+      `LIVE-${sourceId}`, `引擎 ${model}；引用 ${validated.evidence.length} 份根據。`,
     ),
   ]);
   const analysis: ConversationAnalysis = {
     sourceId,
     inputMessageAt: Number(conversation.lastMessageAt),
     ...validated,
+    engine,
     model,
     status: "ready",
     updatedTimestamp: now,
   };
-  return json({ analysis, cached: false, configured: true });
+  return json({ analysis, cached: false, configured: openAIConfigured, engine });
 }
 
 async function readConversationAnalysis(db: D1Database, sourceId: string): Promise<ConversationAnalysis | null> {
@@ -658,6 +668,7 @@ async function readConversationAnalysis(db: D1Database, sourceId: string): Promi
     rationale: String(row.rationale),
     draft: String(row.draft),
     evidence,
+    engine: String(row.model).startsWith("rules-") ? "rules" : "openai",
     model: String(row.model),
     status: String(row.status),
     updatedTimestamp: Number(row.updatedTimestamp),

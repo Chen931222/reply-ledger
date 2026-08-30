@@ -367,6 +367,8 @@ button { color: inherit; }
 .pause-notice p { margin: 7px 0 0; font-size: 11px; }
 .pause-notice.ai-unavailable { border-color: var(--line); color: var(--ink); background: #f4f0e7; }
 .pause-notice.ai-unavailable strong { color: var(--accent); }
+.pause-notice.rules-notice { border-color: var(--ink); color: var(--ink); background: #fffdf8; }
+.pause-notice.rules-notice strong { display: block; color: var(--accent); font: 700 10px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }
 .is-paused .analysis-grid,
 .is-paused .draft-block,
 .is-paused .sources { opacity: .5; }

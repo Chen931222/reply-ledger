@@ -5,6 +5,13 @@ workflows. The product keeps demo cases visibly separate from verified live
 LINE events, records incoming events in D1, and never sends from the AI draft
 surface automatically.
 
+Analysis uses a dual-engine design. When `OPENAI_API_KEY` is available on the
+server, structured Responses API output is preferred. Without a key—or when
+the provider is temporarily unavailable—the workspace falls back to the
+deterministic, explainable `Rules v1` engine. The fallback only cites workspace
+knowledge and never guesses price, stock, installation cost, medical diagnosis,
+or medication dosage.
+
 The public product page lives at `/`. The authenticated operational workspace
 lives at `/app`; live LINE records are never rendered on the public route.
 

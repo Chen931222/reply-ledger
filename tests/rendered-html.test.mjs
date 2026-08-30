@@ -387,7 +387,7 @@ test("a retry uses the same LINE retry key and treats LINE 409 as already accept
   }
 });
 
-function createAnalysisDb() {
+function createAnalysisDb({ text = "L-42 含安裝多少？", rules = [{ title: "2026 零售價目表 · L-42", body: "燈具售價 NT$8,600；不含安裝。" }] } = {}) {
   const batches = [];
   return {
     batches,
@@ -399,17 +399,17 @@ function createAnalysisDb() {
             args,
             async first() {
               if (sql.includes("FROM line_conversations")) {
-                return { sourceId: "U1234567890", lastMessageText: "L-42 含安裝多少？", lastMessageDirection: "inbound", lastMessageAt: 1787152000000, status: "open" };
+                return { sourceId: "U1234567890", lastMessageText: text, lastMessageDirection: "inbound", lastMessageAt: 1787152000000, status: "open" };
               }
               if (sql.includes("FROM conversation_analyses")) return null;
               return null;
             },
             async all() {
               if (sql.includes("WITH conversation_messages")) {
-                return { results: [{ speaker: "customer", text: "L-42 含安裝多少？", timestamp: 1787152000000 }] };
+                return { results: [{ speaker: "customer", text, timestamp: 1787152000000 }] };
               }
               if (sql.includes("FROM workspace_knowledge_rules")) {
-                return { results: [{ title: "2026 零售價目表 · L-42", body: "燈具售價 NT$8,600；不含安裝。" }] };
+                return { results: rules };
               }
               return { results: [] };
             },
@@ -456,6 +456,7 @@ test("AI analysis uses structured Responses output and only stores a human-revie
     const result = await response.json();
     assert.equal(result.analysis.confidence, 91);
     assert.equal(result.analysis.status, "ready");
+    assert.equal(result.analysis.engine, "openai");
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "https://api.openai.com/v1/responses");
     assert.equal(calls[0].body.store, false);
@@ -470,7 +471,7 @@ test("AI analysis uses structured Responses output and only stores a human-revie
   }
 });
 
-test("AI analysis fails closed when no server-side OpenAI key is configured", async () => {
+test("Rules v1 analyzes and persists when no server-side OpenAI key is configured", async () => {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("ai-unconfigured-test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
@@ -480,7 +481,91 @@ test("AI analysis fails closed when no server-side OpenAI key is configured", as
     headers: { "content-type": "application/json", origin: "https://reply-ledger.example", "oai-authenticated-user-id": "owner-1" },
     body: JSON.stringify({ sourceId: "U1234567890" }),
   }), { DB: db }, { waitUntil() {}, passThroughOnException() {} });
-  assert.equal(response.status, 503);
-  assert.deepEqual(await response.json(), { error: "OpenAI analysis is not configured", configured: false });
-  assert.equal(db.batches.length, 0);
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.configured, false);
+  assert.equal(result.engine, "rules");
+  assert.equal(result.analysis.engine, "rules");
+  assert.equal(result.analysis.model, "rules-v1");
+  assert.match(result.analysis.draft, /NT\$8,600/);
+  assert.match(result.analysis.draft, /安裝費.*確認/);
+  assert.equal(db.batches.length, 1);
+});
+
+test("an OpenAI provider failure falls back to Rules v1 without losing the draft", async () => {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("ai-fallback-test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  const db = createAnalysisDb();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("provider unavailable", { status: 503 });
+  try {
+    const response = await worker.fetch(new Request("https://reply-ledger.example/api/ai/analyze", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://reply-ledger.example", "oai-authenticated-user-id": "owner-1" },
+      body: JSON.stringify({ sourceId: "U1234567890" }),
+    }), { DB: db, OPENAI_API_KEY: "test-openai-key", LINE_WORKSPACE_MODE: "retail" }, { waitUntil() {}, passThroughOnException() {} });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.engine, "rules");
+    assert.equal(result.analysis.model, "rules-v1");
+    assert.equal(db.batches.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Rules v1 keeps 20 retail and clinic scenarios within the safety boundaries", async () => {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("rules-fixtures-test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  const retailRules = [
+    { title: "2026 零售價目表 · L-42", body: "L-42 吊燈售價 NT$8,600；不含安裝。" },
+    { title: "餐桌吊燈選型手冊", body: "餐桌燈常見色溫 2700–3000K；仍需依空間確認。" },
+    { title: "安裝報價規則 · 現場確認", body: "未取得出線位置、天花板與固定點照片前，不提供安裝總價。" },
+  ];
+  const clinicRules = [
+    { title: "緊急徵象 · 立即轉介", body: "呼吸困難或意識改變應立即轉介急診。" },
+    { title: "用藥安全 · 不推算劑量", body: "不得依聊天內容計算個別用藥劑量。" },
+    { title: "症狀觀察 · 不代替診斷", body: "訊息回覆不得取代醫師診斷。" },
+  ];
+  const fixtures = [
+    { mode: "retail", text: "L-42 多少錢？", intent: /商品報價/, draft: /NT\$8,600/ },
+    { mode: "retail", text: "L-42 含安裝多少？", intent: /商品與安裝報價/, draft: /安裝費.*確認/ },
+    { mode: "retail", text: "這個吊燈要怎麼安裝在天花板？", intent: /安裝條件確認/, draft: /現場照片/ },
+    { mode: "retail", text: "現在有現貨嗎？", intent: /庫存、交期或配送/, draft: /不先猜測現貨/ },
+    { mode: "retail", text: "寄到高雄大概要多久？", intent: /庫存、交期或配送/, draft: /配送縣市/ },
+    { mode: "retail", text: "燈突然不亮了，可以維修嗎？", intent: /售後維修/, draft: /真人客服/ },
+    { mode: "retail", text: "收到就是破損的，我要退款", intent: /客訴與退換貨/, draft: /退換貨流程/ },
+    { mode: "retail", text: "燈座在冒煙還有燒焦味", intent: /電氣安全事件/, urgency: "高", draft: /停止使用/ },
+    { mode: "retail", text: "餐桌上想裝吊燈，推薦哪一款？", intent: /燈具選購/, draft: /天花板高度/ },
+    { mode: "retail", text: "客廳色溫應該怎麼選？", intent: /燈具選購/, draft: /色溫/ },
+    { mode: "retail", text: "你好", intent: /資訊不足/, maxConfidence: 50, draft: /想詢問/ },
+    { mode: "retail", text: "多少錢？", intent: /商品報價/, draft: /完整燈具型號/, excludes: /NT\$/ },
+    { mode: "clinic", text: "我喘不過氣而且嘴唇發紫", intent: /緊急症狀轉介/, urgency: "高", draft: /119/ },
+    { mode: "clinic", text: "家人突然昏倒、意識不清", intent: /緊急症狀轉介/, urgency: "高", draft: /急診/ },
+    { mode: "clinic", text: "小孩這個藥要吃多少劑量？", intent: /用藥與劑量詢問/, draft: /不要自行增減藥量/ },
+    { mode: "clinic", text: "退燒藥一次要喝幾cc？", intent: /用藥與劑量詢問/, draft: /不能.*推算/ },
+    { mode: "clinic", text: "發燒咳嗽是不是流感？", intent: /症狀與診斷詢問/, draft: /無法安全判斷診斷/ },
+    { mode: "clinic", text: "身上突然出紅疹，嚴重嗎？", intent: /症狀與診斷詢問/, draft: /醫療人員/ },
+    { mode: "clinic", text: "我想預約下週門診", intent: /掛號與門診資訊/, draft: /希望的日期/ },
+    { mode: "clinic", text: "診所地址在哪？營業到幾點？", intent: /掛號與門診資訊/, draft: /門診時間/ },
+  ];
+  assert.equal(fixtures.length, 20);
+  for (const [index, fixture] of fixtures.entries()) {
+    const db = createAnalysisDb({ text: fixture.text, rules: fixture.mode === "clinic" ? clinicRules : retailRules });
+    const response = await worker.fetch(new Request("https://reply-ledger.example/api/ai/analyze", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://reply-ledger.example", "oai-authenticated-user-id": `fixture-${index}` },
+      body: JSON.stringify({ sourceId: "U1234567890" }),
+    }), { DB: db, LINE_WORKSPACE_MODE: fixture.mode }, { waitUntil() {}, passThroughOnException() {} });
+    assert.equal(response.status, 200, fixture.text);
+    const { analysis } = await response.json();
+    assert.match(analysis.intent, fixture.intent, fixture.text);
+    if (fixture.urgency) assert.equal(analysis.urgency, fixture.urgency, fixture.text);
+    assert.match(analysis.draft, fixture.draft, fixture.text);
+    if (fixture.excludes) assert.doesNotMatch(analysis.draft, fixture.excludes, fixture.text);
+    if (fixture.maxConfidence) assert.ok(analysis.confidence <= fixture.maxConfidence, fixture.text);
+    assert.equal(analysis.engine, "rules", fixture.text);
+  }
 });

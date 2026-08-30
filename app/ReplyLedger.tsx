@@ -16,6 +16,7 @@ type ConversationAnalysis = {
   rationale: string;
   draft: string;
   evidence: string[];
+  engine: "openai" | "rules";
   model: string;
   status: string;
   updatedTimestamp: number;
@@ -25,6 +26,8 @@ type LineStatus = {
   receiveReady: boolean;
   sendReady: boolean;
   aiReady: boolean;
+  analysisReady: boolean;
+  analysisMode: "openai" | "rules";
   workspaceMode: string;
   eventCount: number;
   lastEventAt: number | null;
@@ -225,7 +228,7 @@ export default function ReplyLedger() {
         draft: analysis?.draft ?? `您好，已收到您的訊息「${conversation.lastMessageText ?? ""}」。請問您想詢問燈具選購、報價、安裝，還是售後服務呢？`,
         messages: timeline.map(({ side, time, text }) => ({ side, time, text })),
         sources: analysis?.evidence.length
-          ? analysis.evidence.map((item) => ({ label: "AI 引用根據", excerpt: item }))
+          ? analysis.evidence.map((item) => ({ label: analysis.engine === "rules" ? "規則命中" : "AI 引用根據", excerpt: item }))
           : [{
               label: "LINE 已驗證對話",
               excerpt: `${formatLineTime(conversation.lastMessageAt)} 更新；來源 ${maskLineId(conversation.sourceId)}。`,
@@ -314,7 +317,7 @@ export default function ReplyLedger() {
   useEffect(() => {
     if (paused || selected.kind !== "live" || !selected.sourceId) return;
     const sourceId = selected.sourceId;
-    if (!lineStatus?.aiReady) return;
+    if (!lineStatus?.analysisReady) return;
     const currentAnalysis = analysisByConversation[sourceId];
     if (currentAnalysis && currentAnalysis.inputMessageAt >= (selected.latestActivityTimestamp ?? 0)) return;
     let active = true;
@@ -338,7 +341,7 @@ export default function ReplyLedger() {
       if (active) setAnalysisStateByConversation((current) => ({ ...current, [sourceId]: "error" }));
     });
     return () => { active = false; };
-  }, [analysisByConversation, lineStatus?.aiReady, paused, selected.kind, selected.latestActivityTimestamp, selected.sourceId]);
+  }, [analysisByConversation, lineStatus?.analysisReady, paused, selected.kind, selected.latestActivityTimestamp, selected.sourceId]);
 
   async function loadMoreConversations() {
     if (!conversationCursor) return;
@@ -557,21 +560,22 @@ export default function ReplyLedger() {
   }, [audit, lineOutbox]);
   const lineState = lineStatus?.receiveReady ? (lineStatus.eventCount > 0 ? "live" : "ready") : "demo";
   const lineStateLabel = lineState === "live" ? "LINE 已連線" : lineState === "ready" ? "LINE 待測試" : modeInfo[mode].status;
+  const selectedAnalysis = selected.kind === "live" && selected.sourceId ? analysisByConversation[selected.sourceId] : undefined;
   const selectedAnalysisState = selected.kind === "live" && selected.sourceId
-    ? !lineStatus?.aiReady
+    ? !lineStatus?.analysisReady
       ? "unavailable"
-      : analysisByConversation[selected.sourceId]
+      : selectedAnalysis
         ? "ready"
         : analysisStateByConversation[selected.sourceId] ?? "idle"
     : "ready";
   const confidenceLabel = selected.kind !== "live"
     ? `${selected.confidence}%`
     : selectedAnalysisState === "ready"
-      ? `${selected.confidence}%`
+      ? `${selectedAnalysis?.engine === "rules" ? "規則 " : ""}${selected.confidence}%`
       : selectedAnalysisState === "loading"
         ? "判讀中"
         : selectedAnalysisState === "unavailable"
-          ? "AI 未啟用"
+          ? "判讀未就緒"
           : selectedAnalysisState === "error"
             ? "判讀失敗"
             : "需覆核";
@@ -600,7 +604,7 @@ export default function ReplyLedger() {
             <button className={mode === "retail" ? "active" : ""} onClick={() => changeMode("retail")}>燈飾零售</button>
             <button className={mode === "clinic" ? "active" : ""} onClick={() => changeMode("clinic")}>診所觀察員</button>
           </div>
-          <button className={`pause-button ${paused ? "paused" : ""}`} type="button" onClick={() => { setPaused(!paused); flash(paused ? "AI 觀察已恢復。" : "AI 觀察已暫停，真人仍可查看既有內容。"); }}>
+          <button className={`pause-button ${paused ? "paused" : ""}`} type="button" onClick={() => { setPaused(!paused); flash(paused ? "自動判讀已恢復。" : "自動判讀已暫停，真人仍可查看既有內容。"); }}>
             <span className="live-dot" aria-hidden="true" />
             {paused ? "恢復觀察" : lineStateLabel}
           </button>
@@ -673,9 +677,10 @@ export default function ReplyLedger() {
           </section>
 
           <aside className={`advice-panel ${paused ? "is-paused" : ""}`}>
-            <div className="section-label"><span>02</span><p>AI 建議</p><strong className="confidence">{confidenceLabel}</strong></div>
-            {paused && <div className="pause-notice"><strong>AI 觀察已暫停</strong><p>既有分析仍保留，但不會產生新建議。</p></div>}
-            {selected.kind === "live" && selectedAnalysisState === "unavailable" && <div className="pause-notice ai-unavailable"><strong>OpenAI 分析尚未設定</strong><p>目前只顯示安全保守草稿；訊息仍會正常保存，且不會自動送出。</p></div>}
+            <div className="section-label"><span>02</span><p>判讀建議</p><strong className="confidence">{confidenceLabel}</strong></div>
+            {paused && <div className="pause-notice"><strong>自動判讀已暫停</strong><p>既有分析仍保留，但不會產生新建議。</p></div>}
+            {selected.kind === "live" && selectedAnalysisState === "unavailable" && <div className="pause-notice ai-unavailable"><strong>判讀服務尚未就緒</strong><p>目前只顯示安全保守草稿；訊息仍會正常保存，且不會自動送出。</p></div>}
+            {selected.kind === "live" && selectedAnalysisState === "ready" && selectedAnalysis?.engine === "rules" && <div className="pause-notice rules-notice"><strong>RULES V1 · 規則判讀</strong><p>目前使用可解釋規則，不會假裝是 AI；每則草稿仍需真人覆核。</p></div>}
             {selected.kind === "live" && selectedAnalysisState === "error" && <div className="pause-notice ai-unavailable"><strong>本次判讀失敗</strong><p>工作台保留原始訊息與安全草稿，請由真人判讀後再回覆。</p></div>}
             <div className={`attention-panel ${selected.pendingReply === false ? "resolved" : ""}`}>
               <span>{selected.pendingReply === false ? "DONE" : "NEXT ACTION"}</span>
@@ -739,7 +744,7 @@ export default function ReplyLedger() {
             <article><span>01</span><p>資料庫</p><strong>{lineStatus?.databaseReady ? "持久化已就緒" : "尚未建立"}</strong></article>
             <article><span>02</span><p>接收</p><strong>{lineStatus?.receiveReady ? "簽章驗證已備妥" : "等待 Channel secret"}</strong></article>
             <article><span>03</span><p>傳送</p><strong>{lineStatus?.sendReady ? "人工確認後可送出" : "等待 Access token"}</strong></article>
-            <article><span>04</span><p>AI 判讀</p><strong>{lineStatus?.aiReady ? "Responses API 已備妥" : "等待 OpenAI API key"}</strong></article>
+            <article><span>04</span><p>判讀引擎</p><strong>{lineStatus?.aiReady ? "OpenAI + Rules 備援" : lineStatus?.analysisReady ? "Rules v1 已備妥" : "尚未就緒"}</strong></article>
           </div>
           <div className="live-inbox-head"><p>已驗證事件</p><span>{lineInbox.length} / 最近 50 筆</span></div>
           {lineLoading ? <div className="empty-state">正在讀取連線狀態。</div> : lineInbox.length === 0 ? (
