@@ -628,7 +628,7 @@ export default function ReplyLedger() {
       </button>
 
       {view === "workspace" && (
-        <section className="workbench" aria-label="AI 客服觀察工作台">
+        <section className="workbench" aria-label="客服判讀與回覆工作台">
           <aside className="queue-panel">
             <div className="section-label"><span>01</span><p>{cases[0]?.kind === "live" ? "真實待回覆" : "示範案例"}</p><strong>{cases[0]?.kind === "live" ? pendingCount : cases.length}</strong></div>
             <div className="queue-status-tabs" aria-label="案件狀態">
