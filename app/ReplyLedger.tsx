@@ -63,6 +63,9 @@ type LineConversationSummary = {
   lastMessageAt: number;
   status: "open" | "done";
 };
+type ConversationCounts = { all: number; open: number; done: number };
+type QueueStatus = "open" | "done" | "all";
+type QueueSort = "oldest" | "newest";
 type LineConversationMessage = {
   direction: "inbound" | "outbound";
   messageKey: string;
@@ -76,6 +79,7 @@ type WorkbenchCase = LedgerCase & {
   revision?: string;
   latestActivityTimestamp?: number;
   pendingReply?: boolean;
+  overdue?: boolean;
 };
 type SendState = "idle" | "confirming" | "sending" | "sent" | "error";
 type AnalysisState = "idle" | "loading" | "ready" | "unavailable" | "error";
@@ -84,8 +88,8 @@ function formatMessageTime(timestamp: number) {
   return new Intl.DateTimeFormat("zh-TW", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(timestamp));
 }
 
-function formatWaitingTime(timestamp: number) {
-  const minutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000));
+function formatWaitingTime(timestamp: number, now: number) {
+  const minutes = Math.max(0, Math.floor((now - timestamp) / 60_000));
   if (minutes < 1) return "剛剛";
   if (minutes < 60) return `${minutes} 分鐘`;
   const hours = Math.floor(minutes / 60);
@@ -93,16 +97,31 @@ function formatWaitingTime(timestamp: number) {
   return `${Math.floor(hours / 24)} 天`;
 }
 
-async function fetchLineSnapshot() {
+function conversationSearchParams(status: QueueStatus, sort: QueueSort, query: string, limit = 40, cursor?: string | null) {
+  const params = new URLSearchParams({ status, sort, limit: String(limit) });
+  if (query.trim()) params.set("q", query.trim());
+  if (cursor) params.set("cursor", cursor);
+  return params;
+}
+
+function sortConversationSummaries(items: LineConversationSummary[], sort: QueueSort) {
+  return [...items].sort((left, right) => {
+    const timeOrder = sort === "oldest" ? left.lastMessageAt - right.lastMessageAt : right.lastMessageAt - left.lastMessageAt;
+    return timeOrder || left.sourceId.localeCompare(right.sourceId);
+  });
+}
+
+async function fetchLineSnapshot(status: QueueStatus, sort: QueueSort, query: string) {
   try {
+    const conversationQuery = conversationSearchParams(status, sort, query);
     const [statusResponse, conversationsResponse, outboxResponse] = await Promise.all([
       fetch("/api/line/status", { headers: { accept: "application/json" } }),
-      fetch("/api/line/conversations?status=all&limit=30", { headers: { accept: "application/json" } }),
+      fetch(`/api/line/conversations?${conversationQuery}`, { headers: { accept: "application/json" } }),
       fetch("/api/line/outbox?limit=50", { headers: { accept: "application/json" } }),
     ]);
     const status = statusResponse.ok ? await statusResponse.json() as LineStatus : null;
     const conversations = conversationsResponse.ok
-      ? await conversationsResponse.json() as { conversations: LineConversationSummary[]; nextCursor: string | null }
+      ? await conversationsResponse.json() as { conversations: LineConversationSummary[]; nextCursor: string | null; counts?: ConversationCounts }
       : null;
     const outbox = outboxResponse.ok ? await outboxResponse.json() as { messages: LineOutboxMessage[] } : null;
     const failed = [statusResponse, conversationsResponse, outboxResponse].filter((response) => !response.ok);
@@ -110,11 +129,12 @@ async function fetchLineSnapshot() {
       status,
       conversations: conversations?.conversations ?? null,
       conversationCursor: conversations?.nextCursor ?? null,
+      conversationCounts: conversations?.counts ?? null,
       outbox: outbox?.messages ?? null,
       error: failed.length > 0 ? "部分 LINE 資料暫時無法更新；目前保留上次成功讀取的內容。" : "",
     };
   } catch {
-    return { status: null, conversations: null, conversationCursor: null, outbox: null, error: "LINE 連線暫時中斷；目前保留上次成功讀取的內容。" };
+    return { status: null, conversations: null, conversationCursor: null, conversationCounts: null, outbox: null, error: "LINE 連線暫時中斷；目前保留上次成功讀取的內容。" };
   }
 }
 
@@ -177,6 +197,14 @@ export default function ReplyLedger() {
   const [lineOutbox, setLineOutbox] = useState<LineOutboxMessage[]>([]);
   const [lineConversations, setLineConversations] = useState<LineConversationSummary[]>([]);
   const [conversationCursor, setConversationCursor] = useState<string | null>(null);
+  const [conversationCounts, setConversationCounts] = useState<ConversationCounts>({ all: 0, open: 0, done: 0 });
+  const [queueStatus, setQueueStatus] = useState<QueueStatus>("open");
+  const [queueSort, setQueueSort] = useState<QueueSort>("oldest");
+  const [queueSearch, setQueueSearch] = useState("");
+  const [debouncedQueueSearch, setDebouncedQueueSearch] = useState("");
+  const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [clockNow, setClockNow] = useState(0);
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, LineConversationMessage[]>>({});
   const [messageCursorByConversation, setMessageCursorByConversation] = useState<Record<string, string | null>>({});
   const [analysisByConversation, setAnalysisByConversation] = useState<Record<string, ConversationAnalysis>>({});
@@ -189,6 +217,15 @@ export default function ReplyLedger() {
   const auditCounter = useRef(200);
   const sendRequestId = useRef<string | null>(null);
   const selectedRevision = useRef("");
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const lastAutoScrolledConversation = useRef("");
+
+  useEffect(() => {
+    const updateClock = () => setClockNow(Date.now());
+    updateClock();
+    const timer = window.setInterval(updateClock, 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const liveCases = useMemo<WorkbenchCase[]>(() => {
     return lineConversations.map((conversation) => {
@@ -208,6 +245,7 @@ export default function ReplyLedger() {
         key: message.messageKey,
       })).sort((left, right) => left.timestamp - right.timestamp || left.key.localeCompare(right.key));
       const pendingReply = conversation.status === "open" && conversation.lastMessageDirection === "inbound";
+      const overdue = pendingReply && clockNow > 0 && clockNow - conversation.lastMessageAt >= 30 * 60_000;
       return {
         id: `LIVE-${conversation.sourceId}`,
         kind: "live",
@@ -217,8 +255,9 @@ export default function ReplyLedger() {
         pendingReply,
         customer: `LINE 使用者 ${maskLineId(conversation.sourceId)}`,
         title: "LINE 即時訊息",
-        waiting: formatWaitingTime(conversation.lastMessageAt),
-        tag: pendingReply ? "真實 LINE" : "已回覆",
+        waiting: formatWaitingTime(conversation.lastMessageAt, clockNow || conversation.lastMessageAt),
+        tag: pendingReply ? overdue ? "逾時待回" : "待回覆" : "已回覆",
+        overdue,
         intent: analysis?.intent ?? "待人工判讀",
         urgency: analysis?.urgency ?? "待確認",
         risk: analysis?.risk ?? "尚未分類",
@@ -234,16 +273,28 @@ export default function ReplyLedger() {
               excerpt: `${formatLineTime(conversation.lastMessageAt)} 更新；來源 ${maskLineId(conversation.sourceId)}。`,
             }],
       };
-    }).sort((left, right) => {
-      return (right.latestActivityTimestamp ?? 0) - (left.latestActivityTimestamp ?? 0);
     });
-  }, [analysisByConversation, lineConversations, messagesByConversation]);
+  }, [analysisByConversation, clockNow, lineConversations, messagesByConversation]);
 
   const demoCases = useMemo<WorkbenchCase[]>(() => casesByMode[mode].map((item) => ({ ...item, kind: "demo" })), [mode]);
-  const cases = mode === "retail" && liveCases.length > 0 ? liveCases : demoCases;
+  const hasLiveWorkspace = mode === "retail" && ((lineStatus?.eventCount ?? 0) > 0 || lineConversations.length > 0 || conversationCounts.all > 0);
+  const emptyLiveCase = useMemo<WorkbenchCase>(() => ({
+    id: "LIVE-EMPTY", kind: "live", sourceId: null, pendingReply: false, customer: "LINE 收件匣", title: "沒有符合條件的對話",
+    waiting: "—", tag: "佇列已清空", intent: "無", urgency: "低", risk: "無", confidence: 100,
+    observation: "目前的搜尋與篩選條件下沒有對話。訊息仍持續寫入資料庫，新訊息會自動出現在左側佇列。",
+    why: "工作台只載入目前需要看的資料頁，避免上百則對話同時擠進畫面並拖慢操作。", draft: "",
+    messages: [{ side: "staff", time: "—", text: "可以調整左側篩選條件，或清除搜尋文字查看其他對話。" }], sources: [],
+  }), []);
+  const queueCases = hasLiveWorkspace ? liveCases : demoCases;
+  const cases = queueCases.length > 0 ? queueCases : [emptyLiveCase];
   const selected = cases.find((item) => item.id === selectedId) ?? cases[0];
   const currentDraft = selected.id === selectedId ? draft : selected.draft;
-  const pendingCount = cases.filter((item) => item.kind === "live" && item.pendingReply).length;
+  const pendingCount = hasLiveWorkspace ? conversationCounts.open : cases.filter((item) => item.kind === "live" && item.pendingReply).length;
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQueueSearch(queueSearch), 280);
+    return () => window.clearTimeout(timer);
+  }, [queueSearch]);
 
   useEffect(() => {
     let active = true;
@@ -259,30 +310,40 @@ export default function ReplyLedger() {
 
   useEffect(() => {
     let active = true;
-    async function loadLineData() {
-      const result = await fetchLineSnapshot();
+    async function loadLineData(replace: boolean) {
+      const result = await fetchLineSnapshot(queueStatus, queueSort, debouncedQueueSearch);
       if (!active) return;
       if (result.status) setLineStatus(result.status);
-      if (result.conversations) setLineConversations(result.conversations);
+      if (result.conversations) {
+        setLineConversations((current) => {
+          if (replace) return result.conversations!;
+          const targetSize = Math.max(40, current.length);
+          const merged = new Map(current.map((item) => [item.sourceId, item]));
+          for (const item of result.conversations!) merged.set(item.sourceId, item);
+          return sortConversationSummaries([...merged.values()], queueSort).slice(0, targetSize);
+        });
+      }
       setConversationCursor(result.conversationCursor);
+      if (result.conversationCounts) setConversationCounts(result.conversationCounts);
       if (result.outbox) setLineOutbox(result.outbox);
       setLineError(result.error);
       setLineLoading(false);
     }
-    void loadLineData();
-    const refreshTimer = window.setInterval(() => void loadLineData(), 10_000);
+    void loadLineData(true);
+    const refreshTimer = window.setInterval(() => void loadLineData(false), 10_000);
     return () => { active = false; window.clearInterval(refreshTimer); };
-  }, []);
+  }, [debouncedQueueSearch, queueSort, queueStatus]);
 
   const refreshLineData = useCallback(async () => {
-    const result = await fetchLineSnapshot();
+    const result = await fetchLineSnapshot(queueStatus, queueSort, debouncedQueueSearch);
     if (result.status) setLineStatus(result.status);
     if (result.conversations) setLineConversations(result.conversations);
     setConversationCursor(result.conversationCursor);
+    if (result.conversationCounts) setConversationCounts(result.conversationCounts);
     if (result.outbox) setLineOutbox(result.outbox);
     setLineError(result.error);
     setLineLoading(false);
-  }, []);
+  }, [debouncedQueueSearch, queueSort, queueStatus]);
 
   useEffect(() => {
     if (view !== "line") return;
@@ -345,21 +406,24 @@ export default function ReplyLedger() {
 
   async function loadMoreConversations() {
     if (!conversationCursor) return;
+    setLoadingMoreConversations(true);
     try {
-      const response = await fetch(`/api/line/conversations?status=all&limit=30&cursor=${encodeURIComponent(conversationCursor)}`, {
+      const query = conversationSearchParams(queueStatus, queueSort, debouncedQueueSearch, 40, conversationCursor);
+      const response = await fetch(`/api/line/conversations?${query}`, {
         headers: { accept: "application/json" },
       });
       if (!response.ok) throw new Error("無法載入更多聯絡人。");
-      const result = await response.json() as { conversations: LineConversationSummary[]; nextCursor: string | null };
+      const result = await response.json() as { conversations: LineConversationSummary[]; nextCursor: string | null; counts?: ConversationCounts };
       setLineConversations((current) => {
         const merged = new Map(current.map((item) => [item.sourceId, item]));
         for (const item of result.conversations) merged.set(item.sourceId, item);
-        return [...merged.values()].sort((left, right) => right.lastMessageAt - left.lastMessageAt || left.sourceId.localeCompare(right.sourceId));
+        return sortConversationSummaries([...merged.values()], queueSort);
       });
       setConversationCursor(result.nextCursor);
+      if (result.counts) setConversationCounts(result.counts);
     } catch (error) {
       setLineError(error instanceof Error ? error.message : "無法載入更多聯絡人。");
-    }
+    } finally { setLoadingMoreConversations(false); }
   }
 
   async function loadOlderMessages() {
@@ -367,6 +431,7 @@ export default function ReplyLedger() {
     const sourceId = selected.sourceId;
     const cursor = messageCursorByConversation[sourceId];
     if (!cursor) return;
+    setLoadingOlderMessages(true);
     try {
       const result = await fetchConversationMessages(sourceId, cursor);
       setMessagesByConversation((current) => {
@@ -377,8 +442,19 @@ export default function ReplyLedger() {
       setMessageCursorByConversation((current) => ({ ...current, [sourceId]: result.nextCursor }));
     } catch (error) {
       setLineError(error instanceof Error ? error.message : "無法載入較舊訊息。");
-    }
+    } finally { setLoadingOlderMessages(false); }
   }
+
+  function jumpToLatestMessage() {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }
+
+  useEffect(() => {
+    if (!selected.sourceId || selected.messages.length === 0 || lastAutoScrolledConversation.current === selected.sourceId) return;
+    lastAutoScrolledConversation.current = selected.sourceId;
+    const frame = window.requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ block: "end" }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [selected.messages.length, selected.sourceId]);
 
   useEffect(() => {
     const revision = `${selected.id}:${selected.revision ?? "demo"}`;
@@ -630,23 +706,32 @@ export default function ReplyLedger() {
       {view === "workspace" && (
         <section className="workbench" aria-label="客服判讀與回覆工作台">
           <aside className="queue-panel">
-            <div className="section-label"><span>01</span><p>{cases[0]?.kind === "live" ? "真實待回覆" : "示範案例"}</p><strong>{cases[0]?.kind === "live" ? pendingCount : cases.length}</strong></div>
-            <div className="queue-status-tabs" aria-label="案件狀態">
-              <span className="active">待處理 <b>{cases[0]?.kind === "live" ? pendingCount : cases.length}</b></span>
-              <span>已完成 <b>{lineOutbox.filter((message) => message.status === "sent").length}</b></span>
+            <div className="section-label"><span>01</span><p>{hasLiveWorkspace ? "即時對話佇列" : "示範案例"}</p><strong aria-live="polite">{hasLiveWorkspace ? pendingCount : cases.length}</strong></div>
+            <div className={`queue-status-tabs ${hasLiveWorkspace ? "" : "demo-tabs"}`} aria-label="案件狀態">
+              {hasLiveWorkspace ? (["open", "done", "all"] as QueueStatus[]).map((status) => (
+                <button type="button" className={queueStatus === status ? "active" : ""} key={status} onClick={() => { setQueueStatus(status); setConversationCursor(null); }}>
+                  {status === "open" ? "待處理" : status === "done" ? "已完成" : "全部"}<b>{conversationCounts[status]}</b>
+                </button>
+              )) : <><span className="active">待處理 <b>{cases.length}</b></span><span>已完成 <b>0</b></span></>}
             </div>
-            {cases.map((item) => (
-              <button className={`queue-item ${item.id === selected.id ? "active" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }}>
+            {hasLiveWorkspace && <div className="queue-tools">
+              <label className="queue-search"><span>搜尋</span><input type="search" value={queueSearch} onChange={(event) => setQueueSearch(event.target.value)} placeholder="訊息內容或 LINE ID" aria-label="搜尋 LINE 對話" /></label>
+              <label className="queue-sort"><span>排序</span><select value={queueSort} onChange={(event) => setQueueSort(event.target.value as QueueSort)} aria-label="對話排序"><option value="oldest">最久等待</option><option value="newest">最新訊息</option></select></label>
+              <p>目前顯示 {queueCases.length} / {conversationCounts[queueStatus]} 則</p>
+            </div>}
+            {queueCases.length === 0 && <div className="queue-empty"><strong>沒有符合條件的對話</strong><span>清除搜尋，或切換上方狀態。</span></div>}
+            {queueCases.map((item) => (
+              <button className={`queue-item ${item.id === selected.id ? "active" : ""} ${item.overdue ? "overdue" : ""}`} key={item.id} onClick={() => { setSelectedId(item.id); setDraft(item.draft); setEditing(false); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }}>
                 <span className="queue-topline"><span className={item.requiresHuman ? "risk-tag" : ""}>{item.tag}</span><time>{item.waiting}</time></span>
                 <strong>{item.kind === "live" ? "LINE 聯絡人" : item.customer}</strong>
                 {item.kind === "live" && <small className="queue-identity">{maskLineId(item.sourceId ?? null)}</small>}
                 <span className="queue-preview">{item.messages[item.messages.length - 1].text}</span>
               </button>
             ))}
-            {cases[0]?.kind === "live" && conversationCursor && (
-              <button className="pagination-button" type="button" onClick={loadMoreConversations}>載入更多對話</button>
+            {hasLiveWorkspace && conversationCursor && (
+              <button className="pagination-button" type="button" onClick={loadMoreConversations} disabled={loadingMoreConversations}>{loadingMoreConversations ? "正在載入…" : "再載入 40 則對話"}</button>
             )}
-            <footer className="queue-footer"><span>{cases[0]?.kind === "live" ? `真實 LINE · ${cases.length} 位` : "DEMO · 非真實訊息"}</span><span>{cases[0]?.kind === "live" ? "即時同步" : "示範模式"}</span></footer>
+            <footer className="queue-footer"><span>{hasLiveWorkspace ? `真實 LINE · 共 ${conversationCounts.all} 位` : "DEMO · 非真實訊息"}</span><span>{hasLiveWorkspace ? "40 筆分頁載入" : "示範模式"}</span></footer>
           </aside>
 
           <section className="conversation-panel">
@@ -659,8 +744,9 @@ export default function ReplyLedger() {
               <span className="case-number">CASE {selected.id}</span>
             </div>
             <div className="messages">
+              {selected.kind === "live" && selected.sourceId && <div className="timeline-toolbar"><span>已載入 {selected.messages.length} 則</span><button type="button" onClick={jumpToLatestMessage}>跳到最新 ↓</button></div>}
               {selected.kind === "live" && selected.sourceId && messageCursorByConversation[selected.sourceId] && (
-                <button className="older-messages-button" type="button" onClick={loadOlderMessages}>↑ 載入較舊訊息</button>
+                <button className="older-messages-button" type="button" onClick={loadOlderMessages} disabled={loadingOlderMessages}>{loadingOlderMessages ? "正在載入…" : "↑ 載入前 50 則訊息"}</button>
               )}
               {selected.messages.map((message, index) => (
                 <div className={`message-row ${message.side}`} key={`${selected.id}-${index}`}>
@@ -671,6 +757,7 @@ export default function ReplyLedger() {
                   </div>
                 </div>
               ))}
+              <div ref={messagesEndRef} className="messages-end" aria-hidden="true" />
             </div>
             <div className="observation-note"><span>觀察</span>{selected.observation}</div>
             <div className="why-note"><span>為什麼</span><p>{selected.why}</p></div>

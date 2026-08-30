@@ -265,33 +265,57 @@ async function handleLineConversations(request: Request, env: Env): Promise<Resp
   if (!new Set(["open", "done", "all"]).has(statusParam)) {
     return json({ error: "Invalid conversation status" }, 400);
   }
+  const sortParam = url.searchParams.get("sort") ?? "newest";
+  if (!new Set(["newest", "oldest"]).has(sortParam)) {
+    return json({ error: "Invalid conversation sort" }, 400);
+  }
+  const searchQuery = (url.searchParams.get("q") ?? "").trim().slice(0, 80);
   const rawCursor = url.searchParams.get("cursor");
   const cursor = parsePageCursor(rawCursor);
   if (rawCursor && !cursor) return json({ error: "Invalid cursor" }, 400);
 
   const filters: string[] = [];
   const bindings: Array<string | number> = [];
+  const countFilters: string[] = [];
+  const countBindings: Array<string | number> = [];
+  if (searchQuery) {
+    const searchPattern = `%${searchQuery}%`;
+    filters.push("(source_id LIKE ? OR last_message_text LIKE ?)");
+    bindings.push(searchPattern, searchPattern);
+    countFilters.push("(source_id LIKE ? OR last_message_text LIKE ?)");
+    countBindings.push(searchPattern, searchPattern);
+  }
   if (statusParam !== "all") {
     filters.push("status = ?");
     bindings.push(statusParam);
   }
   if (cursor) {
-    filters.push("(last_message_at < ? OR (last_message_at = ? AND source_id > ?))");
+    filters.push(sortParam === "oldest"
+      ? "(last_message_at > ? OR (last_message_at = ? AND source_id > ?))"
+      : "(last_message_at < ? OR (last_message_at = ? AND source_id > ?))");
     bindings.push(cursor.timestamp, cursor.timestamp, cursor.key);
   }
   const where = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+  const countWhere = countFilters.length > 0 ? `WHERE ${countFilters.join(" AND ")}` : "";
+  const order = sortParam === "oldest" ? "ASC" : "DESC";
 
   try {
-    const result = await env.DB.prepare(
+    const [result, countResult] = await Promise.all([env.DB.prepare(
       `SELECT source_id AS sourceId, source_type AS sourceType,
               last_message_text AS lastMessageText,
               last_message_direction AS lastMessageDirection,
               last_message_at AS lastMessageAt, status
        FROM line_conversations
        ${where}
-       ORDER BY last_message_at DESC, source_id ASC
+       ORDER BY last_message_at ${order}, source_id ASC
        LIMIT ?`,
-    ).bind(...bindings, limit + 1).all();
+    ).bind(...bindings, limit + 1).all(), env.DB.prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open,
+              SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done
+       FROM line_conversations
+       ${countWhere}`,
+    ).bind(...countBindings).first<Record<string, unknown>>()]);
     const rows = result.results as Array<Record<string, unknown>>;
     const hasMore = rows.length > limit;
     const conversations = rows.slice(0, limit);
@@ -299,7 +323,12 @@ async function handleLineConversations(request: Request, env: Env): Promise<Resp
     const nextCursor = hasMore && last
       ? makePageCursor(Number(last.lastMessageAt), String(last.sourceId))
       : null;
-    return json({ conversations, nextCursor });
+    const counts = {
+      all: Number(countResult?.total ?? 0),
+      open: Number(countResult?.open ?? 0),
+      done: Number(countResult?.done ?? 0),
+    };
+    return json({ conversations, nextCursor, counts });
   } catch {
     return json({ conversations: [], nextCursor: null, error: "Database migration is pending" }, 503);
   }

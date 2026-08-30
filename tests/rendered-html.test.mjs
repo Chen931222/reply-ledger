@@ -57,7 +57,9 @@ test("ships the tour and both guarded scenario sets", async () => {
   assert.match(client, /稽核紀錄/);
   assert.match(client, /\/api\/line\/send/);
   assert.match(client, /\/api\/line\/outbox/);
-  assert.match(client, /\/api\/line\/conversations\?status=all&limit=30/);
+  assert.match(client, /\/api\/line\/conversations\?/);
+  assert.match(client, /再載入 40 則對話/);
+  assert.match(client, /跳到最新/);
   assert.match(client, /\/api\/workspace\/knowledge/);
   assert.match(client, /\/api\/workspace\/audit/);
   assert.match(client, /\/api\/ai\/analyze/);
@@ -208,6 +210,10 @@ test("LINE conversations and message history use stable cursor pagination", asyn
           bind(...args) {
             calls.push({ sql, args });
             return {
+              async first() {
+                if (sql.includes("COUNT(*) AS total")) return { total: 2, open: 1, done: 1 };
+                return null;
+              },
               async all() {
                 if (sql.includes("FROM line_conversations")) {
                   return { results: [
@@ -239,6 +245,7 @@ test("LINE conversations and message history use stable cursor pagination", asyn
   const conversations = await conversationsResponse.json();
   assert.equal(conversations.conversations.length, 1);
   assert.equal(conversations.nextCursor, "2000:U1234567890");
+  assert.deepEqual(conversations.counts, { all: 2, open: 1, done: 1 });
 
   const messagesResponse = await worker.fetch(new Request(
     "https://reply-ledger.example/api/line/conversations/U1234567890/messages?limit=1",
@@ -250,6 +257,50 @@ test("LINE conversations and message history use stable cursor pagination", asyn
   assert.equal(messages.nextCursor, "2000:IN-2");
   assert.ok(calls.some((call) => call.sql.includes("ORDER BY last_message_at DESC, source_id ASC")));
   assert.ok(calls.some((call) => call.sql.includes("ORDER BY messageTimestamp DESC, messageKey DESC")));
+});
+
+test("a high-volume queue stays searchable and paginated instead of rendering every conversation", async () => {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("line-volume-test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  const calls = [];
+  const rows = Array.from({ length: 41 }, (_, index) => ({
+    sourceId: `U${String(index).padStart(10, "0")}`,
+    sourceType: "user",
+    lastMessageText: `報價詢問 ${index + 1}`,
+    lastMessageDirection: "inbound",
+    lastMessageAt: 1000 + index,
+    status: "open",
+  }));
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            calls.push({ sql, args });
+            return {
+              async first() {
+                if (sql.includes("COUNT(*) AS total")) return { total: 240, open: 180, done: 60 };
+                return null;
+              },
+              async all() { return { results: rows }; },
+            };
+          },
+        };
+      },
+    },
+  };
+  const response = await worker.fetch(new Request(
+    "https://reply-ledger.example/api/line/conversations?status=open&sort=oldest&q=%E5%A0%B1%E5%83%B9&limit=40",
+    { headers: { "oai-authenticated-user-id": "owner-1" } },
+  ), env, { waitUntil() {}, passThroughOnException() {} });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.conversations.length, 40);
+  assert.equal(body.nextCursor, "1039:U0000000039");
+  assert.deepEqual(body.counts, { all: 240, open: 180, done: 60 });
+  assert.ok(calls.some((call) => call.sql.includes("ORDER BY last_message_at ASC, source_id ASC")));
+  assert.ok(calls.some((call) => call.args.includes("%報價%") && call.args.includes("open")));
 });
 
 function createOutboundDb(initialRows = []) {
