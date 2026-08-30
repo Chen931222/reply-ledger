@@ -62,10 +62,23 @@ type LineConversationSummary = {
   lastMessageDirection: "inbound" | "outbound";
   lastMessageAt: number;
   status: "open" | "done";
+  assignedActorId: string | null;
+  assignedActorEmail: string | null;
+  assignedAt: number | null;
+};
+type ConversationInternalNote = {
+  id: string;
+  sourceId: string;
+  noteText: string;
+  actorId: string;
+  actorEmail: string | null;
+  createdTimestamp: number;
 };
 type ConversationCounts = { all: number; open: number; done: number };
 type QueueStatus = "open" | "done" | "all";
 type QueueSort = "oldest" | "newest";
+type QueueScope = "all" | "mine" | "unassigned" | "overdue";
+type AdviceTab = "suggestion" | "evidence" | "customer";
 type LineConversationMessage = {
   direction: "inbound" | "outbound";
   messageKey: string;
@@ -80,6 +93,9 @@ type WorkbenchCase = LedgerCase & {
   latestActivityTimestamp?: number;
   pendingReply?: boolean;
   overdue?: boolean;
+  assignedActorId?: string | null;
+  assignedActorEmail?: string | null;
+  assignedAt?: number | null;
 };
 type SendState = "idle" | "confirming" | "sending" | "sent" | "error";
 type AnalysisState = "idle" | "loading" | "ready" | "unavailable" | "error";
@@ -97,8 +113,8 @@ function formatWaitingTime(timestamp: number, now: number) {
   return `${Math.floor(hours / 24)} 天`;
 }
 
-function conversationSearchParams(status: QueueStatus, sort: QueueSort, query: string, limit = 40, cursor?: string | null) {
-  const params = new URLSearchParams({ status, sort, limit: String(limit) });
+function conversationSearchParams(status: QueueStatus, sort: QueueSort, scope: QueueScope, query: string, limit = 40, cursor?: string | null) {
+  const params = new URLSearchParams({ status, sort, scope, limit: String(limit) });
   if (query.trim()) params.set("q", query.trim());
   if (cursor) params.set("cursor", cursor);
   return params;
@@ -111,9 +127,9 @@ function sortConversationSummaries(items: LineConversationSummary[], sort: Queue
   });
 }
 
-async function fetchLineSnapshot(status: QueueStatus, sort: QueueSort, query: string) {
+async function fetchLineSnapshot(status: QueueStatus, sort: QueueSort, scope: QueueScope, query: string) {
   try {
-    const conversationQuery = conversationSearchParams(status, sort, query);
+    const conversationQuery = conversationSearchParams(status, sort, scope, query);
     const [statusResponse, conversationsResponse, outboxResponse] = await Promise.all([
       fetch("/api/line/status", { headers: { accept: "application/json" } }),
       fetch(`/api/line/conversations?${conversationQuery}`, { headers: { accept: "application/json" } }),
@@ -146,6 +162,14 @@ async function fetchConversationMessages(sourceId: string, cursor?: string | nul
   });
   if (!response.ok) throw new Error("無法讀取這位聯絡人的歷史訊息。");
   return response.json() as Promise<{ messages: LineConversationMessage[]; nextCursor: string | null }>;
+}
+
+async function fetchConversationNotes(sourceId: string) {
+  const response = await fetch(`/api/line/conversations/${encodeURIComponent(sourceId)}/notes`, {
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error("無法讀取團隊備註。");
+  return response.json() as Promise<{ notes: ConversationInternalNote[] }>;
 }
 
 async function fetchLineInbox() {
@@ -200,6 +224,7 @@ export default function ReplyLedger() {
   const [conversationCounts, setConversationCounts] = useState<ConversationCounts>({ all: 0, open: 0, done: 0 });
   const [queueStatus, setQueueStatus] = useState<QueueStatus>("open");
   const [queueSort, setQueueSort] = useState<QueueSort>("oldest");
+  const [queueScope, setQueueScope] = useState<QueueScope>("all");
   const [queueSearch, setQueueSearch] = useState("");
   const [debouncedQueueSearch, setDebouncedQueueSearch] = useState("");
   const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
@@ -209,6 +234,11 @@ export default function ReplyLedger() {
   const [messageCursorByConversation, setMessageCursorByConversation] = useState<Record<string, string | null>>({});
   const [analysisByConversation, setAnalysisByConversation] = useState<Record<string, ConversationAnalysis>>({});
   const [analysisStateByConversation, setAnalysisStateByConversation] = useState<Record<string, AnalysisState>>({});
+  const [notesByConversation, setNotesByConversation] = useState<Record<string, ConversationInternalNote[]>>({});
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [adviceTab, setAdviceTab] = useState<AdviceTab>("suggestion");
+  const [assignmentSaving, setAssignmentSaving] = useState(false);
   const [lineLoading, setLineLoading] = useState(true);
   const [lineError, setLineError] = useState("");
   const [sendState, setSendState] = useState<SendState>("idle");
@@ -258,6 +288,9 @@ export default function ReplyLedger() {
         waiting: formatWaitingTime(conversation.lastMessageAt, clockNow || conversation.lastMessageAt),
         tag: pendingReply ? overdue ? "逾時待回" : "待回覆" : "已回覆",
         overdue,
+        assignedActorId: conversation.assignedActorId,
+        assignedActorEmail: conversation.assignedActorEmail,
+        assignedAt: conversation.assignedAt,
         intent: analysis?.intent ?? "待人工判讀",
         urgency: analysis?.urgency ?? "待確認",
         risk: analysis?.risk ?? "尚未分類",
@@ -311,7 +344,7 @@ export default function ReplyLedger() {
   useEffect(() => {
     let active = true;
     async function loadLineData(replace: boolean) {
-      const result = await fetchLineSnapshot(queueStatus, queueSort, debouncedQueueSearch);
+      const result = await fetchLineSnapshot(queueStatus, queueSort, queueScope, debouncedQueueSearch);
       if (!active) return;
       if (result.status) setLineStatus(result.status);
       if (result.conversations) {
@@ -332,10 +365,10 @@ export default function ReplyLedger() {
     void loadLineData(true);
     const refreshTimer = window.setInterval(() => void loadLineData(false), 10_000);
     return () => { active = false; window.clearInterval(refreshTimer); };
-  }, [debouncedQueueSearch, queueSort, queueStatus]);
+  }, [debouncedQueueSearch, queueScope, queueSort, queueStatus]);
 
   const refreshLineData = useCallback(async () => {
-    const result = await fetchLineSnapshot(queueStatus, queueSort, debouncedQueueSearch);
+    const result = await fetchLineSnapshot(queueStatus, queueSort, queueScope, debouncedQueueSearch);
     if (result.status) setLineStatus(result.status);
     if (result.conversations) setLineConversations(result.conversations);
     setConversationCursor(result.conversationCursor);
@@ -343,7 +376,7 @@ export default function ReplyLedger() {
     if (result.outbox) setLineOutbox(result.outbox);
     setLineError(result.error);
     setLineLoading(false);
-  }, [debouncedQueueSearch, queueSort, queueStatus]);
+  }, [debouncedQueueSearch, queueScope, queueSort, queueStatus]);
 
   useEffect(() => {
     if (view !== "line") return;
@@ -374,6 +407,18 @@ export default function ReplyLedger() {
     const refreshTimer = window.setInterval(() => void loadMessages(), 10_000);
     return () => { active = false; window.clearInterval(refreshTimer); };
   }, [selected.kind, selected.sourceId, selected.revision]);
+
+  useEffect(() => {
+    if (selected.kind !== "live" || !selected.sourceId) return;
+    const sourceId = selected.sourceId;
+    let active = true;
+    void fetchConversationNotes(sourceId).then((result) => {
+      if (active) setNotesByConversation((current) => ({ ...current, [sourceId]: result.notes }));
+    }).catch((error) => {
+      if (active) setLineError(error instanceof Error ? error.message : "無法讀取團隊備註。");
+    });
+    return () => { active = false; };
+  }, [selected.kind, selected.sourceId]);
 
   useEffect(() => {
     if (paused || selected.kind !== "live" || !selected.sourceId) return;
@@ -408,7 +453,7 @@ export default function ReplyLedger() {
     if (!conversationCursor) return;
     setLoadingMoreConversations(true);
     try {
-      const query = conversationSearchParams(queueStatus, queueSort, debouncedQueueSearch, 40, conversationCursor);
+      const query = conversationSearchParams(queueStatus, queueSort, queueScope, debouncedQueueSearch, 40, conversationCursor);
       const response = await fetch(`/api/line/conversations?${query}`, {
         headers: { accept: "application/json" },
       });
@@ -466,6 +511,8 @@ export default function ReplyLedger() {
     setSendState("idle");
     setSendError("");
     setSendRetryable(false);
+    setAdviceTab("suggestion");
+    setNoteDraft("");
     sendRequestId.current = null;
   }, [selected.draft, selected.id, selected.revision]);
 
@@ -580,9 +627,55 @@ export default function ReplyLedger() {
     flash("已拒絕。這則建議不會被送出，也不會自動學習。");
   }
 
+  async function updateAssignment(action: "self" | "unassign") {
+    if (selected.kind !== "live" || !selected.sourceId) {
+      flash("示範案例無法指派。");
+      return;
+    }
+    setAssignmentSaving(true);
+    try {
+      const response = await fetch(`/api/line/conversations/${encodeURIComponent(selected.sourceId)}/assignment`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const result = await response.json().catch(() => null) as { assignment?: { assignedActorId: string | null; assignedActorEmail: string | null; assignedAt: number | null }; error?: string } | null;
+      if (!response.ok || !result?.assignment) throw new Error(result?.error ?? "無法更新負責人。");
+      setLineConversations((items) => items.map((item) => item.sourceId === selected.sourceId ? { ...item, ...result.assignment! } : item));
+      flash(action === "self" ? "這則對話已由你接手。" : "已解除指派，回到團隊佇列。");
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "無法更新負責人。");
+    } finally {
+      setAssignmentSaving(false);
+    }
+  }
+
   function handToHuman() {
-    logAction("轉交真人", selected.requiresHuman ? "命中高風險規則，已通知負責人。" : "由使用者主動要求人工接手。 ");
-    flash(mode === "clinic" ? "已通知值班人員並保留完整理由。" : "已交給真人客服，AI 暫停這則對話的建議。 ");
+    void updateAssignment("self");
+  }
+
+  async function addInternalNote() {
+    if (selected.kind !== "live" || !selected.sourceId || !noteDraft.trim()) return;
+    setNoteSaving(true);
+    try {
+      const response = await fetch(`/api/line/conversations/${encodeURIComponent(selected.sourceId)}/notes`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ note: noteDraft.trim() }),
+      });
+      const result = await response.json().catch(() => null) as { note?: ConversationInternalNote; error?: string } | null;
+      if (!response.ok || !result?.note) throw new Error(result?.error ?? "無法儲存備註。");
+      setNotesByConversation((current) => ({
+        ...current,
+        [selected.sourceId!]: [result.note!, ...(current[selected.sourceId!] ?? [])],
+      }));
+      setNoteDraft("");
+      flash("內部備註已儲存，不會傳送到 LINE。");
+    } catch (error) {
+      flash(error instanceof Error ? error.message : "無法儲存備註。");
+    } finally {
+      setNoteSaving(false);
+    }
   }
 
   async function addRule() {
@@ -644,6 +737,8 @@ export default function ReplyLedger() {
         ? "ready"
         : analysisStateByConversation[selected.sourceId] ?? "idle"
     : "ready";
+  const selectedNotes = selected.kind === "live" && selected.sourceId ? notesByConversation[selected.sourceId] ?? [] : [];
+  const assignmentLabel = selected.assignedActorEmail ?? selected.assignedActorId ?? "尚未指派";
   const confidenceLabel = selected.kind !== "live"
     ? `${selected.confidence}%`
     : selectedAnalysisState === "ready"
@@ -671,8 +766,8 @@ export default function ReplyLedger() {
         <button className="brand-block" type="button" onClick={() => setView("workspace")} aria-label="回到工作台">
           <span className="brand-mark">R/L</span>
           <div>
-            <p className="eyebrow">REPLY LEDGER · 回覆帳簿</p>
-            <h1>每一句建議，都留下根據。</h1>
+            <h1>Reply Ledger</h1>
+            <p>真人覆核客服台</p>
           </div>
         </button>
         <div className="masthead-actions">
@@ -688,17 +783,16 @@ export default function ReplyLedger() {
       </header>
 
       <nav className="view-nav" aria-label="主要頁面">
-        {(["workspace", "line", "knowledge", "audit"] as View[]).map((item, index) => (
+        {(["workspace", "line", "knowledge", "audit"] as View[]).map((item) => (
           <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}>
-            <span>0{index + 1}</span>{item === "workspace" ? "工作台" : item === "line" ? "LINE 收件匣" : item === "knowledge" ? "知識帳簿" : "稽核紀錄"}
+            {item === "workspace" ? "工作台" : item === "line" ? "LINE 收件匣" : item === "knowledge" ? "知識帳簿" : "稽核紀錄"}
           </button>
         ))}
         <a className="tour-link" href="/intro.html">觀看 60 秒導覽 ↗</a>
-        <p>{modeInfo[mode].note}</p>
       </nav>
 
       <button className={`integration-strip state-${lineState}`} type="button" onClick={() => setView("line")}>
-        <span className="integration-kicker">CONNECTION</span>
+        <span className="integration-kicker"><span className="live-dot" aria-hidden="true" /> LINE</span>
         <strong>{lineError || (lineLoading ? "目前顯示 Demo 資料，正在確認 LINE 狀態" : lineState === "live" ? `已收到 ${lineStatus?.eventCount ?? 0} 個真實事件` : lineState === "ready" ? "Webhook 已設定，等待第一則真實訊息" : "目前顯示 Demo 資料，尚未連接 LINE 官方帳號")}</strong>
         <span>{lineStatus?.sendReady ? "人工傳送已備妥" : "傳送功能鎖定"} →</span>
       </button>
@@ -706,7 +800,7 @@ export default function ReplyLedger() {
       {view === "workspace" && (
         <section className="workbench" aria-label="客服判讀與回覆工作台">
           <aside className="queue-panel">
-            <div className="section-label"><span>01</span><p>{hasLiveWorkspace ? "即時對話佇列" : "示範案例"}</p><strong aria-live="polite">{hasLiveWorkspace ? pendingCount : cases.length}</strong></div>
+            <div className="section-label"><div><p>{hasLiveWorkspace ? "收件匣" : "示範案例"}</p><small>{hasLiveWorkspace ? `${pendingCount} 則等待回覆` : "安全示範資料"}</small></div><strong aria-live="polite">{hasLiveWorkspace ? pendingCount : cases.length}</strong></div>
             <div className={`queue-status-tabs ${hasLiveWorkspace ? "" : "demo-tabs"}`} aria-label="案件狀態">
               {hasLiveWorkspace ? (["open", "done", "all"] as QueueStatus[]).map((status) => (
                 <button type="button" className={queueStatus === status ? "active" : ""} key={status} onClick={() => { setQueueStatus(status); setConversationCursor(null); }}>
@@ -714,10 +808,13 @@ export default function ReplyLedger() {
                 </button>
               )) : <><span className="active">待處理 <b>{cases.length}</b></span><span>已完成 <b>0</b></span></>}
             </div>
+            {hasLiveWorkspace && <div className="queue-saved-views" aria-label="智能檢視">
+              {(["all", "mine", "unassigned", "overdue"] as QueueScope[]).map((scope) => <button key={scope} type="button" className={queueScope === scope ? "active" : ""} onClick={() => { setQueueScope(scope); setConversationCursor(null); }}>{scope === "all" ? "全部" : scope === "mine" ? "我的" : scope === "unassigned" ? "未指派" : "逾時"}</button>)}
+            </div>}
             {hasLiveWorkspace && <div className="queue-tools">
               <label className="queue-search"><span>搜尋</span><input type="search" value={queueSearch} onChange={(event) => setQueueSearch(event.target.value)} placeholder="訊息內容或 LINE ID" aria-label="搜尋 LINE 對話" /></label>
               <label className="queue-sort"><span>排序</span><select value={queueSort} onChange={(event) => setQueueSort(event.target.value as QueueSort)} aria-label="對話排序"><option value="oldest">最久等待</option><option value="newest">最新訊息</option></select></label>
-              <p>目前顯示 {queueCases.length} / {conversationCounts[queueStatus]} 則</p>
+              <p>目前載入 {queueCases.length} 則</p>
             </div>}
             {queueCases.length === 0 && <div className="queue-empty"><strong>沒有符合條件的對話</strong><span>清除搜尋，或切換上方狀態。</span></div>}
             {queueCases.map((item) => (
@@ -726,6 +823,7 @@ export default function ReplyLedger() {
                 <strong>{item.kind === "live" ? "LINE 聯絡人" : item.customer}</strong>
                 {item.kind === "live" && <small className="queue-identity">{maskLineId(item.sourceId ?? null)}</small>}
                 <span className="queue-preview">{item.messages[item.messages.length - 1].text}</span>
+                {item.kind === "live" && <span className="queue-owner">{item.assignedActorId ? `負責人 · ${item.assignedActorEmail ?? "目前使用者"}` : "未指派"}</span>}
               </button>
             ))}
             {hasLiveWorkspace && conversationCursor && (
@@ -738,10 +836,10 @@ export default function ReplyLedger() {
             <div className="conversation-head">
               <div>
                 <div className="conversation-status"><span className="channel-chip">{selected.kind === "live" ? "LINE" : "DEMO"}</span><span className={selected.pendingReply === false ? "resolved-chip" : "waiting-chip"}>{selected.pendingReply === false ? "已處理" : "待人工處理"}</span></div>
-                <h2>{selected.title}</h2>
-                <p className="conversation-identity">{selected.kind === "live" ? maskLineId(selected.sourceId ?? null) : selected.customer}</p>
+                <h2>{selected.kind === "live" ? "LINE 聯絡人" : selected.title}</h2>
+                <p className="conversation-identity">{selected.kind === "live" ? `${maskLineId(selected.sourceId ?? null)} · ${assignmentLabel}` : selected.customer}</p>
               </div>
-              <span className="case-number">CASE {selected.id}</span>
+              {selected.kind === "live" && <button className="assign-button" type="button" disabled={assignmentSaving} onClick={() => void updateAssignment(selected.assignedActorId ? "unassign" : "self")}>{assignmentSaving ? "處理中…" : selected.assignedActorId ? "解除指派" : "由我接手"}</button>}
             </div>
             <div className="messages">
               {selected.kind === "live" && selected.sourceId && <div className="timeline-toolbar"><span>已載入 {selected.messages.length} 則</span><button type="button" onClick={jumpToLatestMessage}>跳到最新 ↓</button></div>}
@@ -759,46 +857,33 @@ export default function ReplyLedger() {
               ))}
               <div ref={messagesEndRef} className="messages-end" aria-hidden="true" />
             </div>
-            <div className="observation-note"><span>觀察</span>{selected.observation}</div>
-            <div className="why-note"><span>為什麼</span><p>{selected.why}</p></div>
+            {selected.kind === "live" && <section className="team-composer" aria-label="團隊內部備註">
+              {selectedNotes.length > 0 && <div className="internal-notes-list">
+                {selectedNotes.slice(0, 3).map((note) => <article key={note.id}><div><strong>內部備註</strong><time>{formatLineTime(note.createdTimestamp)}</time></div><p>{note.noteText}</p><small>{note.actorEmail ?? note.actorId}</small></article>)}
+              </div>}
+              <div className="composer-tabs"><span className="active">內部備註</span><span>只供團隊查看，不會傳送給客戶</span></div>
+              <div className="note-compose-row"><textarea value={noteDraft} onChange={(event) => setNoteDraft(event.target.value)} rows={2} maxLength={3000} placeholder="記下追蹤事項、交班資訊或客戶偏好…" aria-label="新增內部備註"/><button type="button" disabled={noteSaving || !noteDraft.trim()} onClick={() => void addInternalNote()}>{noteSaving ? "儲存中…" : "新增備註"}</button></div>
+            </section>}
           </section>
 
           <aside className={`advice-panel ${paused ? "is-paused" : ""}`}>
-            <div className="section-label"><span>02</span><p>判讀建議</p><strong className="confidence">{confidenceLabel}</strong></div>
-            {paused && <div className="pause-notice"><strong>自動判讀已暫停</strong><p>既有分析仍保留，但不會產生新建議。</p></div>}
-            {selected.kind === "live" && selectedAnalysisState === "unavailable" && <div className="pause-notice ai-unavailable"><strong>判讀服務尚未就緒</strong><p>目前只顯示安全保守草稿；訊息仍會正常保存，且不會自動送出。</p></div>}
-            {selected.kind === "live" && selectedAnalysisState === "ready" && selectedAnalysis?.engine === "rules" && <div className="pause-notice rules-notice"><strong>RULES V1 · 規則判讀</strong><p>目前使用可解釋規則，不會假裝是 AI；每則草稿仍需真人覆核。</p></div>}
-            {selected.kind === "live" && selectedAnalysisState === "error" && <div className="pause-notice ai-unavailable"><strong>本次判讀失敗</strong><p>工作台保留原始訊息與安全草稿，請由真人判讀後再回覆。</p></div>}
-            <div className={`attention-panel ${selected.pendingReply === false ? "resolved" : ""}`}>
-              <span>{selected.pendingReply === false ? "DONE" : "NEXT ACTION"}</span>
-              <strong>{selected.pendingReply === false ? "最新訊息已經回覆" : selected.kind === "live" ? "確認客戶需求，再送出回覆" : selected.requiresHuman ? "先確認風險，再決定是否回覆" : "檢查草稿後即可採用"}</strong>
-              <p>{selected.pendingReply === false ? "完整傳送結果已保存在稽核紀錄。" : `目前風險：${selected.risk}`}</p>
-            </div>
-            <div className="analysis-grid">
-              <div><span>意圖</span><strong>{selected.intent}</strong></div>
-              <div><span>急迫度</span><strong>{selected.urgency}</strong></div>
-              <div><span>風險</span><strong className="accent-text">{selected.risk}</strong></div>
-            </div>
-            <div className="draft-block">
-              <div className="draft-heading"><p>建議回覆草稿</p><span>真人覆核後送出</span></div>
-              {editing ? (
-                <textarea aria-label="修改建議回覆" value={currentDraft} onChange={(event) => { if (selected.id !== selectedId) setSelectedId(selected.id); setDraft(event.target.value); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }} rows={11} />
-              ) : selected.kind === "live" ? (
-                <div className="line-message-card" aria-label="LINE 客戶預覽">
-                  <header><span>LIGHTING CONCIERGE</span><strong>BREME 燈飾顧問</strong></header>
-                  <p>{currentDraft}</p>
-                  <footer>REPLY LEDGER · 將由真人確認</footer>
-                </div>
-              ) : <blockquote>{currentDraft}</blockquote>}
-            </div>
-            <details className="sources">
-              <summary>根據 · {selected.sources.length} 份</summary>
-              {selected.sources.map((source, index) => (
-                <div className="source-row" key={source.label}><strong>0{index + 1}</strong><span><b>{source.label}</b>{source.excerpt}</span></div>
-              ))}
-            </details>
-            {selected.requiresHuman && <button className="handoff-banner" type="button" onClick={handToHuman}><strong>高風險事件</strong><span>交給真人處理 →</span></button>}
-            {(sendState === "confirming" || sendState === "sending" || sendState === "error") && (
+            <div className="copilot-head"><div><p>回覆助手</p><span>{paused ? "已暫停" : confidenceLabel}</span></div><nav aria-label="助手資訊"><button className={adviceTab === "suggestion" ? "active" : ""} onClick={() => setAdviceTab("suggestion")}>建議</button><button className={adviceTab === "evidence" ? "active" : ""} onClick={() => setAdviceTab("evidence")}>根據</button><button className={adviceTab === "customer" ? "active" : ""} onClick={() => setAdviceTab("customer")}>客戶</button></nav></div>
+            {adviceTab === "suggestion" && <>
+              {paused && <div className="pause-notice"><strong>自動判讀已暫停</strong><p>既有分析仍保留，但不會產生新建議。</p></div>}
+              {selected.kind === "live" && selectedAnalysisState === "unavailable" && <div className="pause-notice ai-unavailable"><strong>判讀服務尚未就緒</strong><p>目前顯示安全草稿；訊息仍會正常保存。</p></div>}
+              {selected.kind === "live" && selectedAnalysisState === "error" && <div className="pause-notice ai-unavailable"><strong>本次判讀失敗</strong><p>請由真人確認內容後再回覆。</p></div>}
+              <div className={`attention-panel ${selected.pendingReply === false ? "resolved" : ""}`}><span>{selected.pendingReply === false ? "已完成" : "下一步"}</span><strong>{selected.pendingReply === false ? "最新訊息已經回覆" : selected.requiresHuman ? "先確認風險，再決定是否回覆" : "檢查草稿後即可傳送"}</strong><p>{selected.pendingReply === false ? "傳送結果已保存在稽核紀錄。" : `風險：${selected.risk}`}</p></div>
+              <div className="analysis-grid"><div><span>意圖</span><strong>{selected.intent}</strong></div><div><span>急迫度</span><strong>{selected.urgency}</strong></div><div><span>風險</span><strong className="accent-text">{selected.risk}</strong></div></div>
+              <div className="draft-block">
+                <div className="draft-heading"><p>建議回覆</p><span>真人覆核後送出</span></div>
+                {editing ? <textarea aria-label="修改建議回覆" value={currentDraft} onChange={(event) => { if (selected.id !== selectedId) setSelectedId(selected.id); setDraft(event.target.value); setSendState("idle"); setSendError(""); setSendRetryable(false); sendRequestId.current = null; }} rows={9} /> : <div className="draft-copy"><p>{currentDraft}</p></div>}
+              </div>
+              <div className="reason-summary"><span>判讀摘要</span><p>{selected.observation}</p></div>
+              {selected.requiresHuman && <button className="handoff-banner" type="button" onClick={handToHuman}><strong>高風險事件</strong><span>由我接手 →</span></button>}
+            </>}
+            {adviceTab === "evidence" && <div className="copilot-tab-body"><div className="reason-card"><span>判讀理由</span><p>{selected.why}</p></div><div className="source-list"><h3>引用根據 · {selected.sources.length}</h3>{selected.sources.map((source, index) => <article key={source.label}><b>0{index + 1}</b><div><strong>{source.label}</strong><p>{source.excerpt}</p></div></article>)}</div></div>}
+            {adviceTab === "customer" && <div className="copilot-tab-body customer-card"><dl><div><dt>渠道</dt><dd>{selected.kind === "live" ? "LINE 官方帳號" : "示範"}</dd></div><div><dt>識別碼</dt><dd>{selected.kind === "live" ? maskLineId(selected.sourceId ?? null) : selected.customer}</dd></div><div><dt>等待時間</dt><dd>{selected.waiting}</dd></div><div><dt>負責人</dt><dd>{assignmentLabel}</dd></div></dl>{selected.kind === "live" && <button type="button" disabled={assignmentSaving} onClick={() => void updateAssignment(selected.assignedActorId ? "unassign" : "self")}>{selected.assignedActorId ? "解除指派" : "由我接手"}</button>}</div>}
+            {adviceTab === "suggestion" && <>{(sendState === "confirming" || sendState === "sending" || sendState === "error") && (
               <section className="send-confirmation" role="alertdialog" aria-labelledby="send-confirmation-title" aria-describedby="send-confirmation-copy">
                 <p className="margin-label">FINAL CHECK · THIS WILL SEND</p>
                 <h3 id="send-confirmation-title">確認傳送給 {maskLineId(selected.sourceId ?? null)}</h3>
@@ -816,7 +901,7 @@ export default function ReplyLedger() {
               <button type="button" onClick={rejectDraft}>拒絕</button>
             </div>
             <button className="quiet-handoff" type="button" onClick={handToHuman}>不使用建議，直接交給真人</button>
-            <p className="send-lock">只有真人完成第二次確認後才會傳送；LINE 結果與操作者會留下紀錄。</p>
+            <p className="send-lock">只有真人完成第二次確認後才會傳送；LINE 結果與操作者會留下紀錄。</p></>}
           </aside>
         </section>
       )}

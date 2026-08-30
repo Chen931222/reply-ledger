@@ -35,7 +35,7 @@ test("server-renders the protected Reply Ledger workspace for an authenticated u
   const response = await render("/app", true);
   assert.equal(response.status, 200);
   const html = await response.text();
-  assert.match(html, /每一句建議，都留下根據/);
+  assert.match(html, /真人覆核客服台/);
   assert.match(html, /燈飾零售/);
   assert.match(html, /診所觀察員/);
   assert.match(html, /LINE 收件匣/);
@@ -53,7 +53,8 @@ test("ships the tour and both guarded scenario sets", async () => {
   assert.match(data, /安裝費未知/);
   assert.match(data, /兒童用藥／不可推算/);
   assert.doesNotMatch(client, /localStorage/);
-  assert.match(client, /轉交真人/);
+  assert.match(client, /由我接手/);
+  assert.match(client, /內部備註/);
   assert.match(client, /稽核紀錄/);
   assert.match(client, /\/api\/line\/send/);
   assert.match(client, /\/api\/line\/outbox/);
@@ -66,7 +67,7 @@ test("ships the tour and both guarded scenario sets", async () => {
   assert.match(client, /\/messages\?/);
   assert.match(client, /確認，現在傳送/);
   assert.match(client, /selected\.revision/);
-  assert.match(client, /BREME 燈飾顧問/);
+  assert.match(client, /回覆助手/);
 });
 
 test("LINE webhook rejects spoofed requests and accepts a correctly signed verification request", async () => {
@@ -301,6 +302,54 @@ test("a high-volume queue stays searchable and paginated instead of rendering ev
   assert.deepEqual(body.counts, { all: 240, open: 180, done: 60 });
   assert.ok(calls.some((call) => call.sql.includes("ORDER BY last_message_at ASC, source_id ASC")));
   assert.ok(calls.some((call) => call.args.includes("%報價%") && call.args.includes("open")));
+});
+
+test("conversation assignment and internal notes persist with an audit trail", async () => {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("conversation-collaboration-test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  const statements = [];
+  const db = {
+    prepare(sql) {
+      return {
+        bind(...args) {
+          const statement = {
+            sql,
+            args,
+            async all() { return { results: [] }; },
+          };
+          statements.push(statement);
+          return statement;
+        },
+      };
+    },
+    async batch(items) {
+      return items.map(() => ({ meta: { changes: 1 } }));
+    },
+  };
+  const headers = {
+    "content-type": "application/json",
+    "oai-authenticated-user-id": "owner-1",
+    "oai-authenticated-user-email": "owner@example.com",
+    origin: "https://reply-ledger.example",
+  };
+
+  const assignmentResponse = await worker.fetch(new Request(
+    "https://reply-ledger.example/api/line/conversations/U1234567890/assignment",
+    { method: "POST", headers, body: JSON.stringify({ action: "self" }) },
+  ), { DB: db }, { waitUntil() {}, passThroughOnException() {} });
+  assert.equal(assignmentResponse.status, 200);
+  assert.equal((await assignmentResponse.json()).assignment.assignedActorEmail, "owner@example.com");
+
+  const noteResponse = await worker.fetch(new Request(
+    "https://reply-ledger.example/api/line/conversations/U1234567890/notes",
+    { method: "POST", headers, body: JSON.stringify({ note: "明天回電確認安裝高度。" }) },
+  ), { DB: db }, { waitUntil() {}, passThroughOnException() {} });
+  assert.equal(noteResponse.status, 201);
+  assert.equal((await noteResponse.json()).note.noteText, "明天回電確認安裝高度。");
+  assert.ok(statements.some((statement) => statement.sql.includes("UPDATE line_conversations")));
+  assert.ok(statements.some((statement) => statement.sql.includes("INSERT INTO conversation_internal_notes")));
+  assert.ok(statements.filter((statement) => statement.sql.includes("INSERT INTO workspace_audit_events")).length >= 2);
 });
 
 function createOutboundDb(initialRows = []) {

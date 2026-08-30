@@ -71,6 +71,20 @@ const worker = {
       return handleLineConversationMessages(request, env, sourceId);
     }
 
+    const conversationActionMatch = url.pathname.match(/^\/api\/line\/conversations\/([^/]+)\/(notes|assignment)$/);
+    if (conversationActionMatch) {
+      if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
+      let sourceId: string;
+      try {
+        sourceId = decodeURIComponent(conversationActionMatch[1]);
+      } catch {
+        return json({ error: "Invalid LINE source" }, 400);
+      }
+      return conversationActionMatch[2] === "notes"
+        ? handleConversationNotes(request, env, sourceId)
+        : handleConversationAssignment(request, env, sourceId);
+    }
+
     if (url.pathname === "/api/line/send") {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       return handleLineSend(request, env);
@@ -270,6 +284,10 @@ async function handleLineConversations(request: Request, env: Env): Promise<Resp
     return json({ error: "Invalid conversation sort" }, 400);
   }
   const searchQuery = (url.searchParams.get("q") ?? "").trim().slice(0, 80);
+  const scopeParam = url.searchParams.get("scope") ?? "all";
+  if (!new Set(["all", "mine", "unassigned", "overdue"]).has(scopeParam)) {
+    return json({ error: "Invalid conversation scope" }, 400);
+  }
   const rawCursor = url.searchParams.get("cursor");
   const cursor = parsePageCursor(rawCursor);
   if (rawCursor && !cursor) return json({ error: "Invalid cursor" }, 400);
@@ -289,6 +307,15 @@ async function handleLineConversations(request: Request, env: Env): Promise<Resp
     filters.push("status = ?");
     bindings.push(statusParam);
   }
+  if (scopeParam === "mine") {
+    filters.push("assigned_actor_id = ?");
+    bindings.push(request.headers.get("oai-authenticated-user-id") ?? "local-development");
+  } else if (scopeParam === "unassigned") {
+    filters.push("assigned_actor_id IS NULL");
+  } else if (scopeParam === "overdue") {
+    filters.push("status = 'open' AND last_message_direction = 'inbound' AND last_message_at <= ?");
+    bindings.push(Date.now() - 30 * 60_000);
+  }
   if (cursor) {
     filters.push(sortParam === "oldest"
       ? "(last_message_at > ? OR (last_message_at = ? AND source_id > ?))"
@@ -304,7 +331,10 @@ async function handleLineConversations(request: Request, env: Env): Promise<Resp
       `SELECT source_id AS sourceId, source_type AS sourceType,
               last_message_text AS lastMessageText,
               last_message_direction AS lastMessageDirection,
-              last_message_at AS lastMessageAt, status
+              last_message_at AS lastMessageAt, status,
+              assigned_actor_id AS assignedActorId,
+              assigned_actor_email AS assignedActorEmail,
+              assigned_at AS assignedAt
        FROM line_conversations
        ${where}
        ORDER BY last_message_at ${order}, source_id ASC
@@ -334,10 +364,106 @@ async function handleLineConversations(request: Request, env: Env): Promise<Resp
   }
 }
 
+function validLineSource(sourceId: string) {
+  return /^[UCR][A-Za-z0-9_-]{10,}$/.test(sourceId);
+}
+
+async function handleConversationNotes(request: Request, env: Env, sourceId: string): Promise<Response> {
+  if (!env.DB) return json({ notes: [], error: "Database is not configured" }, 503);
+  if (!validLineSource(sourceId)) return json({ error: "Invalid LINE source" }, 400);
+
+  if (request.method === "GET") {
+    try {
+      const result = await env.DB.prepare(
+        `SELECT id, source_id AS sourceId, note_text AS noteText,
+                actor_id AS actorId, actor_email AS actorEmail,
+                created_at AS createdTimestamp
+         FROM conversation_internal_notes
+         WHERE source_id = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 100`,
+      ).bind(sourceId).all();
+      return json({ notes: result.results });
+    } catch {
+      return json({ notes: [], error: "Database migration is pending" }, 503);
+    }
+  }
+
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, { Allow: "GET, POST" });
+  if (!isSameOriginWrite(request)) return json({ error: "Invalid request origin" }, 403);
+  let body: { note?: string };
+  try {
+    body = await request.json() as { note?: string };
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+  const noteText = body.note?.trim() ?? "";
+  if (!noteText || noteText.length > 3000) return json({ error: "Note must contain 1–3000 characters" }, 400);
+
+  const id = crypto.randomUUID();
+  const auditId = crypto.randomUUID();
+  const createdTimestamp = Date.now();
+  const actorId = request.headers.get("oai-authenticated-user-id") ?? "local-development";
+  const actorEmail = request.headers.get("oai-authenticated-user-email");
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO conversation_internal_notes
+        (id, source_id, note_text, actor_id, actor_email, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).bind(id, sourceId, noteText, actorId, actorEmail, createdTimestamp),
+    env.DB.prepare(
+      `INSERT INTO workspace_audit_events
+        (id, occurred_at, actor_id, actor_email, action, case_id, detail)
+       VALUES (?, ?, ?, ?, '新增內部備註', ?, ?)`,
+    ).bind(auditId, createdTimestamp, actorId, actorEmail, `LIVE-${sourceId}`, "備註只供團隊查看，不會傳送到 LINE。"),
+  ]);
+  return json({ note: { id, sourceId, noteText, actorId, actorEmail, createdTimestamp } }, 201);
+}
+
+async function handleConversationAssignment(request: Request, env: Env, sourceId: string): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, { Allow: "POST" });
+  if (!isSameOriginWrite(request)) return json({ error: "Invalid request origin" }, 403);
+  if (!env.DB) return json({ error: "Database is not configured" }, 503);
+  if (!validLineSource(sourceId)) return json({ error: "Invalid LINE source" }, 400);
+  let body: { action?: string };
+  try {
+    body = await request.json() as { action?: string };
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+  if (body.action !== "self" && body.action !== "unassign") return json({ error: "Invalid assignment action" }, 400);
+
+  const actorId = request.headers.get("oai-authenticated-user-id") ?? "local-development";
+  const actorEmail = request.headers.get("oai-authenticated-user-email");
+  const occurredAt = Date.now();
+  const auditId = crypto.randomUUID();
+  const assignedActorId = body.action === "self" ? actorId : null;
+  const assignedActorEmail = body.action === "self" ? actorEmail : null;
+  const assignedAt = body.action === "self" ? occurredAt : null;
+  const update = env.DB.prepare(
+    `UPDATE line_conversations
+     SET assigned_actor_id = ?, assigned_actor_email = ?, assigned_at = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE source_id = ?`,
+  ).bind(assignedActorId, assignedActorEmail, assignedAt, sourceId);
+  const auditInsert = env.DB.prepare(
+    `INSERT INTO workspace_audit_events
+      (id, occurred_at, actor_id, actor_email, action, case_id, detail)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    auditId, occurredAt, actorId, actorEmail,
+    body.action === "self" ? "接手對話" : "解除指派",
+    `LIVE-${sourceId}`,
+    body.action === "self" ? "對話已指派給目前使用者。" : "對話已回到未指派佇列。",
+  );
+  const [updateResult] = await env.DB.batch([update, auditInsert]);
+  if (Number(updateResult.meta.changes ?? 0) < 1) return json({ error: "Conversation not found" }, 404);
+  return json({ assignment: { assignedActorId, assignedActorEmail, assignedAt } });
+}
+
 async function handleLineConversationMessages(request: Request, env: Env, sourceId: string): Promise<Response> {
   if (request.method !== "GET") return json({ error: "Method not allowed" }, 405, { Allow: "GET" });
   if (!env.DB) return json({ messages: [], nextCursor: null, error: "Database is not configured" }, 503);
-  if (!/^[UCR][A-Za-z0-9_-]{10,}$/.test(sourceId)) return json({ error: "Invalid LINE source" }, 400);
+  if (!validLineSource(sourceId)) return json({ error: "Invalid LINE source" }, 400);
 
   const url = new URL(request.url);
   const limit = pageLimit(request, 50, 100);

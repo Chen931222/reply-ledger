@@ -51,10 +51,25 @@ export const lineConversations = sqliteTable("line_conversations", {
   lastMessageDirection: text("last_message_direction").notNull(),
   lastMessageAt: integer("last_message_at").notNull(),
   status: text("status").notNull().default("open"),
+  assignedActorId: text("assigned_actor_id"),
+  assignedActorEmail: text("assigned_actor_email"),
+  assignedAt: integer("assigned_at"),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [
   index("idx_line_conversations_activity").on(table.lastMessageAt),
   index("idx_line_conversations_status_activity").on(table.status, table.lastMessageAt),
+  index("idx_line_conversations_assignee_status_activity").on(table.assignedActorId, table.status, table.lastMessageAt),
+]);
+
+export const conversationInternalNotes = sqliteTable("conversation_internal_notes", {
+  id: text("id").primaryKey(),
+  sourceId: text("source_id").notNull(),
+  noteText: text("note_text").notNull(),
+  actorId: text("actor_id").notNull(),
+  actorEmail: text("actor_email"),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [
+  index("idx_conversation_notes_source_created").on(table.sourceId, table.createdAt),
 ]);
 
 export const lineWebhookEvents = sqliteTable("line_webhook_events", {
