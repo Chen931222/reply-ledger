@@ -107,3 +107,20 @@ export const lineOutboundMessages = sqliteTable("line_outbound_messages", {
   uniqueIndex("idx_line_outbound_request_id").on(table.requestId),
   index("idx_line_outbound_target_created").on(table.targetId, table.createdAt),
 ]);
+
+export const salesLeads = sqliteTable("sales_leads", {
+  id: text("id").primaryKey(),
+  requestType: text("request_type").notNull(),
+  companyName: text("company_name").notNull(),
+  contactName: text("contact_name").notNull(),
+  email: text("email").notNull(),
+  phoneOrLine: text("phone_or_line"),
+  monthlyVolume: text("monthly_volume"),
+  note: text("note"),
+  source: text("source").notNull().default("landing"),
+  status: text("status").notNull().default("new"),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [
+  index("idx_sales_leads_status_created").on(table.status, table.createdAt),
+  index("idx_sales_leads_email_created").on(table.email, table.createdAt),
+]);

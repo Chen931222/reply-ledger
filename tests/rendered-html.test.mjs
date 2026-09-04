@@ -24,11 +24,69 @@ test("server-renders a public product page without exposing private LINE data", 
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
   assert.match(html, /Reply Ledger｜回覆帳簿/);
-  assert.match(html, /AI 不替你說話/);
-  assert.match(html, /登入工作台/);
+  assert.match(html, /回得快/);
+  assert.match(html, /申請 14 天試用/);
+  assert.match(html, /預約 Demo/);
+  assert.match(html, /產品驗證案例/);
+  assert.match(html, /reply-ledger-demo-3min\.mp4/);
   assert.match(html, /公開頁不載入任何真實 LINE 資料/);
   assert.match(html, /https:\/\/reply-ledger-tw\.ntumed301\.chatgpt\.site\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|Building your site|react-loading-skeleton/);
+});
+
+test("public trial and demo applications are validated, stored, and bot-filtered", async () => {
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("lead-test", `${process.pid}-${Date.now()}`);
+  const { default: worker } = await import(workerUrl.href);
+  const inserted = [];
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              async first() { return null; },
+              async run() { inserted.push({ sql, args }); return { meta: { changes: 1 } }; },
+            };
+          },
+        };
+      },
+    },
+  };
+  const headers = { "content-type": "application/json", origin: "https://reply-ledger.example" };
+  const response = await worker.fetch(new Request("https://reply-ledger.example/api/leads", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      requestType: "trial",
+      companyName: "光序燈飾",
+      contactName: "陳店長",
+      email: "owner@example.com",
+      phoneOrLine: "@lighting",
+      monthlyVolume: "300-1000",
+      note: "想先驗證報價流程",
+    }),
+  }), env, { waitUntil() {}, passThroughOnException() {} });
+  assert.equal(response.status, 201);
+  assert.equal(inserted.length, 1);
+  assert.match(inserted[0].sql, /INSERT INTO sales_leads/);
+  assert.equal(inserted[0].args[1], "trial");
+  assert.equal(inserted[0].args[4], "owner@example.com");
+
+  const invalid = await worker.fetch(new Request("https://reply-ledger.example/api/leads", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ requestType: "demo", companyName: "A", contactName: "B", email: "bad" }),
+  }), env, { waitUntil() {}, passThroughOnException() {} });
+  assert.equal(invalid.status, 400);
+
+  const bot = await worker.fetch(new Request("https://reply-ledger.example/api/leads", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ website: "https://spam.example" }),
+  }), env, { waitUntil() {}, passThroughOnException() {} });
+  assert.equal(bot.status, 200);
+  assert.equal(inserted.length, 1);
 });
 
 test("server-renders the protected Reply Ledger workspace for an authenticated user", async () => {

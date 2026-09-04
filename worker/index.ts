@@ -39,6 +39,10 @@ const worker = {
       return handleLineWebhook(request, env);
     }
 
+    if (url.pathname === "/api/leads") {
+      return handleSalesLead(request, env);
+    }
+
     if (url.pathname === "/api/line/status") {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       return handleLineStatus(request, env);
@@ -132,6 +136,69 @@ type LineWebhookEvent = {
   message?: { id?: string; type?: string; text?: string };
 };
 type LineWebhookBody = { destination?: string; events?: LineWebhookEvent[] };
+
+async function handleSalesLead(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, { Allow: "POST" });
+  if (!isSameOriginWrite(request)) return json({ error: "Invalid request origin" }, 403);
+  if (!env.DB) return json({ error: "Application storage is not configured" }, 503);
+
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (contentLength > 20_000) return json({ error: "Payload too large" }, 413);
+
+  let body: Record<string, unknown>;
+  try {
+    body = await request.json() as Record<string, unknown>;
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  const field = (name: string, limit: number) => typeof body[name] === "string" ? body[name].trim().slice(0, limit) : "";
+  const requestType = field("requestType", 20);
+  const companyName = field("companyName", 120);
+  const contactName = field("contactName", 80);
+  const email = field("email", 180).toLowerCase();
+  const phoneOrLine = field("phoneOrLine", 80);
+  const monthlyVolume = field("monthlyVolume", 40);
+  const note = field("note", 1000);
+  const website = field("website", 200);
+
+  // A bot that fills the invisible field receives a normal response without creating junk data.
+  if (website) return json({ ok: true });
+  if (!new Set(["trial", "demo"]).has(requestType)) return json({ error: "請選擇申請試用或預約 Demo" }, 400);
+  if (companyName.length < 2 || contactName.length < 2) return json({ error: "請填寫公司與聯絡人名稱" }, 400);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "請填寫有效的 Email" }, 400);
+
+  const now = Date.now();
+  try {
+    const duplicate = await env.DB.prepare(
+      `SELECT id FROM sales_leads
+       WHERE email = ? AND request_type = ? AND created_at >= ?
+       LIMIT 1`,
+    ).bind(email, requestType, now - 10 * 60_000).first<{ id: string }>();
+    if (duplicate) return json({ ok: true, duplicate: true });
+
+    const id = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO sales_leads
+        (id, request_type, company_name, contact_name, email, phone_or_line,
+         monthly_volume, note, source, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'landing', 'new', ?)`,
+    ).bind(
+      id,
+      requestType,
+      companyName,
+      contactName,
+      email,
+      phoneOrLine || null,
+      monthlyVolume || null,
+      note || null,
+      now,
+    ).run();
+    return json({ ok: true, id }, 201);
+  } catch {
+    return json({ error: "申請暫時無法送出，請稍後再試" }, 503);
+  }
+}
 
 async function handleLineWebhook(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, { Allow: "POST" });
