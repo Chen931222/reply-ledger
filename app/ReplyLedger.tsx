@@ -131,9 +131,9 @@ async function fetchLineSnapshot(status: QueueStatus, sort: QueueSort, scope: Qu
   try {
     const conversationQuery = conversationSearchParams(status, sort, scope, query);
     const [statusResponse, conversationsResponse, outboxResponse] = await Promise.all([
-      fetch("/api/line/status", { headers: { accept: "application/json" } }),
-      fetch(`/api/line/conversations?${conversationQuery}`, { headers: { accept: "application/json" } }),
-      fetch("/api/line/outbox?limit=50", { headers: { accept: "application/json" } }),
+      fetch("/api/workspace/status", { headers: { accept: "application/json" } }),
+      fetch(`/api/workspace/conversations?${conversationQuery}`, { headers: { accept: "application/json" } }),
+      fetch("/api/workspace/outbox?limit=50", { headers: { accept: "application/json" } }),
     ]);
     const status = statusResponse.ok ? await statusResponse.json() as LineStatus : null;
     const conversations = conversationsResponse.ok
@@ -157,7 +157,7 @@ async function fetchLineSnapshot(status: QueueStatus, sort: QueueSort, scope: Qu
 async function fetchConversationMessages(sourceId: string, cursor?: string | null) {
   const query = new URLSearchParams({ limit: "50" });
   if (cursor) query.set("cursor", cursor);
-  const response = await fetch(`/api/line/conversations/${encodeURIComponent(sourceId)}/messages?${query}`, {
+  const response = await fetch(`/api/workspace/conversations/${encodeURIComponent(sourceId)}/messages?${query}`, {
     headers: { accept: "application/json" },
   });
   if (!response.ok) throw new Error("無法讀取這位聯絡人的歷史訊息。");
@@ -165,7 +165,7 @@ async function fetchConversationMessages(sourceId: string, cursor?: string | nul
 }
 
 async function fetchConversationNotes(sourceId: string) {
-  const response = await fetch(`/api/line/conversations/${encodeURIComponent(sourceId)}/notes`, {
+  const response = await fetch(`/api/workspace/conversations/${encodeURIComponent(sourceId)}/notes`, {
     headers: { accept: "application/json" },
   });
   if (!response.ok) throw new Error("無法讀取團隊備註。");
@@ -173,7 +173,7 @@ async function fetchConversationNotes(sourceId: string) {
 }
 
 async function fetchLineInbox() {
-  const response = await fetch("/api/line/inbox?limit=50", { headers: { accept: "application/json" } });
+  const response = await fetch("/api/workspace/inbox?limit=50", { headers: { accept: "application/json" } });
   if (!response.ok) throw new Error("無法讀取 LINE 事件帳簿。");
   return response.json() as Promise<{ events: LineInboxEvent[] }>;
 }
@@ -454,7 +454,7 @@ export default function ReplyLedger() {
     setLoadingMoreConversations(true);
     try {
       const query = conversationSearchParams(queueStatus, queueSort, queueScope, debouncedQueueSearch, 40, conversationCursor);
-      const response = await fetch(`/api/line/conversations?${query}`, {
+      const response = await fetch(`/api/workspace/conversations?${query}`, {
         headers: { accept: "application/json" },
       });
       if (!response.ok) throw new Error("無法載入更多聯絡人。");
@@ -588,7 +588,7 @@ export default function ReplyLedger() {
     setSendState("sending");
     setSendError("");
     try {
-      const response = await fetch("/api/line/send", {
+      const response = await fetch("/api/workspace/send", {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({
@@ -634,7 +634,7 @@ export default function ReplyLedger() {
     }
     setAssignmentSaving(true);
     try {
-      const response = await fetch(`/api/line/conversations/${encodeURIComponent(selected.sourceId)}/assignment`, {
+      const response = await fetch(`/api/workspace/conversations/${encodeURIComponent(selected.sourceId)}/assignment`, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ action }),
@@ -658,7 +658,7 @@ export default function ReplyLedger() {
     if (selected.kind !== "live" || !selected.sourceId || !noteDraft.trim()) return;
     setNoteSaving(true);
     try {
-      const response = await fetch(`/api/line/conversations/${encodeURIComponent(selected.sourceId)}/notes`, {
+      const response = await fetch(`/api/workspace/conversations/${encodeURIComponent(selected.sourceId)}/notes`, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify({ note: noteDraft.trim() }),

@@ -43,27 +43,27 @@ const worker = {
       return handleSalesLead(request, env);
     }
 
-    if (url.pathname === "/api/line/status") {
+    if (url.pathname === "/api/line/status" || url.pathname === "/api/workspace/status") {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       return handleLineStatus(request, env);
     }
 
-    if (url.pathname === "/api/line/inbox") {
+    if (url.pathname === "/api/line/inbox" || url.pathname === "/api/workspace/inbox") {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       return handleLineInbox(request, env);
     }
 
-    if (url.pathname === "/api/line/outbox") {
+    if (url.pathname === "/api/line/outbox" || url.pathname === "/api/workspace/outbox") {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       return handleLineOutbox(request, env);
     }
 
-    if (url.pathname === "/api/line/conversations") {
+    if (url.pathname === "/api/line/conversations" || url.pathname === "/api/workspace/conversations") {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       return handleLineConversations(request, env);
     }
 
-    const messagesMatch = url.pathname.match(/^\/api\/line\/conversations\/([^/]+)\/messages$/);
+    const messagesMatch = url.pathname.match(/^\/api\/(?:line|workspace)\/conversations\/([^/]+)\/messages$/);
     if (messagesMatch) {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       let sourceId: string;
@@ -75,7 +75,7 @@ const worker = {
       return handleLineConversationMessages(request, env, sourceId);
     }
 
-    const conversationActionMatch = url.pathname.match(/^\/api\/line\/conversations\/([^/]+)\/(notes|assignment)$/);
+    const conversationActionMatch = url.pathname.match(/^\/api\/(?:line|workspace)\/conversations\/([^/]+)\/(notes|assignment)$/);
     if (conversationActionMatch) {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       let sourceId: string;
@@ -89,7 +89,7 @@ const worker = {
         : handleConversationAssignment(request, env, sourceId);
     }
 
-    if (url.pathname === "/api/line/send") {
+    if (url.pathname === "/api/line/send" || url.pathname === "/api/workspace/send") {
       if (!isDashboardRequest(request)) return json({ error: "Unauthorized" }, 401);
       return handleLineSend(request, env);
     }

@@ -114,9 +114,9 @@ test("ships the tour and both guarded scenario sets", async () => {
   assert.match(client, /由我接手/);
   assert.match(client, /內部備註/);
   assert.match(client, /稽核紀錄/);
-  assert.match(client, /\/api\/line\/send/);
-  assert.match(client, /\/api\/line\/outbox/);
-  assert.match(client, /\/api\/line\/conversations\?/);
+  assert.match(client, /\/api\/workspace\/send/);
+  assert.match(client, /\/api\/workspace\/outbox/);
+  assert.match(client, /\/api\/workspace\/conversations\?/);
   assert.match(client, /再載入 40 則對話/);
   assert.match(client, /跳到最新/);
   assert.match(client, /\/api\/workspace\/knowledge/);
